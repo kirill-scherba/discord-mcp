@@ -108,7 +108,13 @@ func (b *bot) recordingLoop(vc *discordgo.VoiceConnection, guildID, channelID st
 }
 
 // processUtterance runs STT -> brain -> TTS for a single recorded utterance.
+// Serialized via processMu: while one utterance is being processed (including
+// TTS playback), the next one waits. This prevents two replies from being
+// synthesized and played at the same time.
 func (b *bot) processUtterance(vc *discordgo.VoiceConnection, pcm []int16) {
+	b.processMu.Lock()
+	defer b.processMu.Unlock()
+
 	if len(pcm) < sampleRate/4 { // ignore sub-250ms blips
 		return
 	}
@@ -148,6 +154,10 @@ func (b *bot) processUtterance(vc *discordgo.VoiceConnection, pcm []int16) {
 // Primary provider is edge-tts; if it fails (Microsoft throttling), the
 // OpenAI Audio Speech API is used as a reliable fallback.
 func (b *bot) speak(vc *discordgo.VoiceConnection, text string) {
+	// Serialize playback: only one stream may write to OpusSend at a time.
+	b.speakMu.Lock()
+	defer b.speakMu.Unlock()
+
 	if vc == nil || !vc.Ready {
 		log.Printf("voice: not ready, cannot speak")
 		return

@@ -41,6 +41,12 @@ type bot struct {
 	listening bool
 	ttsSpeaking bool
 
+	// processMu serializes the STT -> brain -> TTS pipeline so replies
+	// never overlap. speakMu guards the OpusSend writer against concurrent
+	// playback from different goroutines.
+	processMu sync.Mutex
+	speakMu   sync.Mutex
+
 	// voice states of users in the channel: userID -> {channelID}
 	usersInChannel map[string]bool
 }
