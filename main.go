@@ -36,8 +36,12 @@ The bot auto-joins the configured voice channel and listens for speech.`),
 	log.Printf("registered %d tools", len(tools()))
 
 	// Start the server over stdin/stdout (JSON-RPC 2.0) — the transport used
-	// by mcp-gateway for local servers.
-	if err := server.ServeStdio(s); err != nil {
-		log.Fatalf("Server error: %v", err)
-	}
+	// by mcp-gateway for local servers. ServeStdio returns when a signal
+	// (SIGTERM/SIGINT) is received or stdin closes.
+	err := server.ServeStdio(s)
+
+	// Graceful shutdown: leave the voice channel and close the gateway so
+	// Discord is immediately notified instead of leaving a ghost connection.
+	log.Printf("mcp: server stopped (%v), shutting down voice bot", err)
+	theBot.shutdown()
 }

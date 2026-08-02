@@ -293,6 +293,24 @@ func (b *bot) leaveVoice() {
 	}
 }
 
+// shutdown performs a graceful shutdown on SIGTERM/SIGINT: leaves the voice
+// channel first (so Discord is notified the bot disconnected) and then closes
+// the gateway session. Without this, a killed process leaves the bot visible
+// in the channel as a ghost until Discord's timeout expires.
+func (b *bot) shutdown() {
+	log.Printf("discord-bot: graceful shutdown")
+	b.leaveVoice()
+	b.mu.Lock()
+	s := b.session
+	b.mu.Unlock()
+	if s != nil {
+		if err := s.Close(); err != nil {
+			log.Printf("discord-bot: gateway close: %v", err)
+		}
+	}
+	log.Printf("discord-bot: shutdown complete")
+}
+
 func isDigits(s string) bool {
 	for _, r := range s {
 		if r < '0' || r > '9' {
