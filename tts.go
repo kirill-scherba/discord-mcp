@@ -1,0 +1,181 @@
+// tts.go — text-to-speech with two providers:
+//  1. edge-tts (Microsoft Edge cloud voices, free) — primary
+//  2. OpenAI Audio Speech API (tts-1) — reliable fallback
+//
+// Both produce mp3; the shared pipeline converts to Opus frames for Discord
+// voice playback: mp3 -> ffmpeg (s16le 48kHz mono PCM) -> Opus frames.
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"time"
+
+	"github.com/hraban/opus"
+)
+
+// edgeTTSPath is the edge-tts CLI inside the virtual environment.
+const edgeTTSPath = "/home/kirill/edge-tts-venv/bin/edge-tts"
+
+// defaultVoice is Baron's chosen voice (edge-tts, no accent, free).
+const defaultVoice = "ru-RU-DmitryNeural"
+
+// openAITTSClient is a dedicated client for OpenAI speech synthesis.
+var openAITTSClient = &http.Client{Timeout: 60 * time.Second}
+
+// openAIVoices is a list of OpenAI voices to try, in order. Baron uses a
+// deep male voice (onyx) first, falling back to others if needed.
+var openAIVoices = []string{"onyx", "alloy", "echo"}
+
+// ttsEdge synthesizes text with edge-tts and returns Opus frames.
+func ttsEdge(text string) ([][]byte, error) {
+	dir, err := os.MkdirTemp("", "discord-tts-*")
+	if err != nil {
+		return nil, err
+	}
+	defer os.RemoveAll(dir)
+
+	mp3Path := filepath.Join(dir, "voice.mp3")
+	cmd := exec.Command(edgeTTSPath,
+		"--voice", defaultVoice,
+		"--text", text,
+		"--write-media", mp3Path,
+	)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return nil, fmt.Errorf("edge-tts: %v: %s", err, trimWhitespace(string(out)))
+	}
+	mp3, err := os.ReadFile(mp3Path)
+	if err != nil {
+		return nil, err
+	}
+	if len(mp3) == 0 {
+		return nil, fmt.Errorf("edge-tts: empty audio")
+	}
+	return mp3ToOpusFrames(mp3)
+}
+
+// ttsOpenAI synthesizes text via the OpenAI Audio Speech API and returns
+// Opus frames. Uses OPENAI_API_KEY (same key as STT).
+func ttsOpenAI(text string) ([][]byte, error) {
+	key := os.Getenv("OPENAI_API_KEY")
+	if key == "" {
+		return nil, fmt.Errorf("OPENAI_API_KEY not set")
+	}
+
+	var lastErr error
+	for _, voice := range openAIVoices {
+		body := map[string]any{
+			"model":           "tts-1",
+			"input":           text,
+			"voice":           voice,
+			"response_format": "mp3",
+		}
+		raw, err := json.Marshal(body)
+		if err != nil {
+			return nil, err
+		}
+
+		req, err := http.NewRequest(http.MethodPost,
+			"https://api.openai.com/v1/audio/speech", bytes.NewReader(raw))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+key)
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := openAITTSClient.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		mp3, readErr := io.ReadAll(io.LimitReader(resp.Body, 5<<20))
+		resp.Body.Close()
+		if readErr != nil {
+			lastErr = readErr
+			continue
+		}
+		if resp.StatusCode != http.StatusOK || len(mp3) == 0 {
+			lastErr = fmt.Errorf("TTS HTTP %d: %s", resp.StatusCode, truncate(string(mp3), 200))
+			continue
+		}
+		frames, err := mp3ToOpusFrames(mp3)
+		if err != nil {
+			return nil, fmt.Errorf("openai tts: %w", err)
+		}
+		return frames, nil
+	}
+	return nil, fmt.Errorf("openai tts: all voices failed: %w", lastErr)
+}
+
+// mp3ToOpusFrames converts mp3 bytes into 20ms Opus frames for Discord voice.
+func mp3ToOpusFrames(mp3 []byte) ([][]byte, error) {
+	dir, err := os.MkdirTemp("", "discord-tts-*")
+	if err != nil {
+		return nil, err
+	}
+	defer os.RemoveAll(dir)
+
+	mp3Path := filepath.Join(dir, "voice.mp3")
+	pcmPath := filepath.Join(dir, "voice.pcm")
+	if err := os.WriteFile(mp3Path, mp3, 0o600); err != nil {
+		return nil, err
+	}
+
+	// ffmpeg -> raw PCM s16le 48kHz mono
+	cmd := exec.Command("ffmpeg", "-y",
+		"-i", mp3Path,
+		"-f", "s16le", "-ar", "48000", "-ac", "1",
+		pcmPath,
+	)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return nil, fmt.Errorf("ffmpeg: %v: %s", err, trimWhitespace(string(out)))
+	}
+
+	pcm, err := os.ReadFile(pcmPath)
+	if err != nil {
+		return nil, err
+	}
+
+	// PCM -> Opus frames (20 ms each)
+	samples := len(pcm) / 2
+	enc, err := opus.NewEncoder(sampleRate, channels, opus.AppVoIP)
+	if err != nil {
+		return nil, err
+	}
+
+	var frames [][]byte
+	buf := make([]byte, 10000)
+	for i := 0; i+frameSamples <= samples; i += frameSamples {
+		frame := make([]int16, frameSamples)
+		for j := 0; j < frameSamples; j++ {
+			idx := (i + j) * 2
+			frame[j] = int16(pcm[idx]) | int16(pcm[idx+1])<<8
+		}
+		n, err := enc.Encode(frame, buf)
+		if err != nil {
+			return nil, fmt.Errorf("opus encode: %w", err)
+		}
+		encoded := make([]byte, n)
+		copy(encoded, buf[:n])
+		frames = append(frames, encoded)
+	}
+
+	if len(frames) == 0 {
+		return nil, fmt.Errorf("no audio frames generated")
+	}
+	return frames, nil
+}
+
+// truncate limits a string to n bytes for log messages.
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
+}
