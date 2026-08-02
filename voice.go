@@ -20,7 +20,7 @@ const (
 	sampleRate    = 48000
 	channels      = 1
 	frameSamples  = 960 // 20 ms at 48 kHz
-	silenceMS     = 700 // end utterance after this much silence
+	silenceMS     = 400 // end utterance after this much silence
 	maxUtteranceS = 30  // hard cap per utterance
 	rmsThreshold  = 300 // voice activity threshold (int16)
 )

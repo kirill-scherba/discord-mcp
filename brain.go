@@ -182,6 +182,8 @@ func resetBrainSession() {
 
 // sendWithRetry sends a message to Baron, recreating the session once if it
 // was lost (Session not found / 404). The message itself is preserved.
+// The entire recreate path is serialised under brainMu to prevent multiple
+// goroutines from racing to create sessions when the persisted one dies.
 func sendWithRetry(text string) (string, error) {
 	sess, err := getBrainSession()
 	if err != nil {
@@ -190,12 +192,24 @@ func sendWithRetry(text string) (string, error) {
 	reply, err := brainCl.SendMessage(sess, text)
 	if err != nil && isSessionGone(err) {
 		log.Printf("brain: session lost, recreating: %v", err)
-		resetBrainSession()
-		sess, err = newVoiceSession(brainCl)
-		if err != nil {
-			return "", err
+		// Atomically drop + recreate under the lock so only ONE goroutine
+		// creates the replacement session.
+		brainMu.Lock()
+		// Double-check: another goroutine may have already recreated while
+		// we were waiting for the lock.
+		if brainSess != nil && brainSess.ID == sess.ID {
+			brainSess = nil
 		}
-		brainSess = sess
+		if brainSess == nil {
+			newSess, createErr := newVoiceSession(brainCl)
+			if createErr != nil {
+				brainMu.Unlock()
+				return "", createErr
+			}
+			brainSess = newSess
+		}
+		sess = brainSess
+		brainMu.Unlock()
 		reply, err = brainCl.SendMessage(sess, text)
 	}
 	if err != nil {
