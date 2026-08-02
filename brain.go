@@ -24,6 +24,11 @@ import (
 // contactsDir is the shared contact book directory (same as mail-mcp).
 const contactsDir = "/srv/contacts"
 
+// opencodeBaseURL is the opencode-serve instance for voice sessions.
+// Uses the same server as mail-mcp (port 7712), separate from the main
+// opencode-serve (7709) that powers the IDE.
+const opencodeBaseURL = "http://127.0.0.1:7712"
+
 var (
 	brainMu   sync.Mutex
 	brainCl   *opencodeclient.Client
@@ -36,6 +41,7 @@ type Contact struct {
 	Name      string `json:"name,omitempty"`
 	Who       string `json:"who,omitempty"`
 	Summary   string `json:"summary,omitempty"`
+	DiscordID string `json:"discord_id,omitempty"`
 	FirstSeen string `json:"first_seen,omitempty"`
 	LastSeen  string `json:"last_seen,omitempty"`
 	TotalMail int    `json:"total_mail"`
@@ -81,6 +87,36 @@ func findContactByName(name string) *Contact {
 	return nil
 }
 
+// findContactByDiscordID returns the contact whose discord_id matches the
+// given Discord user ID. This is the primary lookup — more reliable than
+// name matching since Discord display names can change.
+func findContactByDiscordID(userID string) *Contact {
+	if userID == "" {
+		return nil
+	}
+	entries, err := os.ReadDir(contactsDir)
+	if err != nil {
+		return nil
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(contactsDir, e.Name()))
+		if err != nil {
+			continue
+		}
+		var c Contact
+		if err := json.Unmarshal(data, &c); err != nil {
+			continue
+		}
+		if c.DiscordID == userID {
+			return &c
+		}
+	}
+	return nil
+}
+
 // isSessionGone reports whether the error means the opencode-serve session
 // disappeared (server restart, TTL expiry, manual close). In that case a
 // fresh session must be created. The old session is never closed by us.
@@ -101,10 +137,9 @@ func createBrainSession(cl *opencodeclient.Client) (*opencodeclient.Session, err
 	}
 	log.Printf("brain: session created %s", sess.ID)
 
-	startup := "Ты в голосовом чате Discord. Отвечай кратко и по делу — твои " +
-		"ответы синтезируются в речь и озвучиваются в канале. Обращайся к " +
-		"Кириллу «Ваше Величество». Когда в канал заходит участник, я сообщу " +
-		"тебе, кто это."
+	startup := "Ты находишься в голосовом чате Discord. Это НЕ текстовый чат с " +
+		"Кириллом — ты агент, подключённый к войс-каналу через программу-посредника.\n\n" +
+		"Используй SKILL voice-chat для правил работы в голосовом чате."
 	if _, err := cl.SendMessage(sess, startup); err != nil {
 		return nil, fmt.Errorf("brain: startup message: %w", err)
 	}
@@ -119,7 +154,7 @@ func getBrainSession() (*opencodeclient.Session, error) {
 	brainMu.Lock()
 	defer brainMu.Unlock()
 	if brainCl == nil {
-		brainCl = opencodeclient.New("", 0)
+		brainCl = opencodeclient.New(opencodeBaseURL, 0)
 	}
 	if brainSess == nil {
 		if ps := persistedSession(); ps != nil {
@@ -178,10 +213,18 @@ func brainAsk(text string) (string, error) {
 // shared contact card when the user is known. Baron's reply is spoken aloud
 // into the voice channel.
 func brainNotifyContact(displayName, userID string) {
-	msg := fmt.Sprintf("В голосовой канал зашёл участник: %s (discord id %s).",
+	// Primary lookup: discord_id in the contact book (exact match).
+	// Fallback: name matching (case-insensitive).
+	var c *Contact
+	if c = findContactByDiscordID(userID); c == nil {
+		c = findContactByName(displayName)
+	}
+
+	msg := fmt.Sprintf("[ТЕХНИЧЕСКОЕ] В голосовой канал зашёл участник: %s (discord id %s).",
 		displayName, userID)
-	if c := findContactByName(displayName); c != nil {
-		msg = fmt.Sprintf("В голосовой канал зашёл участник: %s. Это %s.", displayName, c.Name)
+	if c != nil {
+		msg = fmt.Sprintf("[ТЕХНИЧЕСКОЕ] В голосовой канал зашёл участник: %s (discord id %s). Это %s.",
+			displayName, userID, c.Name)
 		if c.Who != "" {
 			msg += " " + c.Who + "."
 		}
