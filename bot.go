@@ -91,8 +91,7 @@ func (b *bot) onReady(s *discordgo.Session, r *discordgo.Ready) {
 	for _, g := range r.Guilds {
 		log.Printf("discord-bot: guild %s (%s)", g.Name, g.ID)
 	}
-	// Auto-join the configured voice channel on start.
-	go b.autoJoin()
+	// Auto-join disabled — use discord_voice_join MCP tool or !voice command.
 }
 
 // autoJoin joins the voice channel from DISCORD_VOICE_CHANNEL env after a
