@@ -277,6 +277,8 @@ func (b *bot) leaveVoice() {
 	b.mu.Lock()
 	vc := b.vc
 	b.vc = nil
+	b.guildID = ""
+	b.channelID = ""
 	b.listening = false
 	b.mu.Unlock()
 	if vc != nil {

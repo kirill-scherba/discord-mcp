@@ -25,9 +25,8 @@ import (
 const contactsDir = "/srv/contacts"
 
 // opencodeBaseURL is the opencode-serve instance for voice sessions.
-// Uses the same server as mail-mcp (port 7712), separate from the main
-// opencode-serve (7709) that powers the IDE.
-const opencodeBaseURL = "http://127.0.0.1:7712"
+// Temporarily switched to main server (7709) for debugging.
+const opencodeBaseURL = "http://127.0.0.1:7709"
 
 var (
 	brainMu   sync.Mutex
@@ -234,7 +233,7 @@ func brainNotifyContact(displayName, userID string) {
 		c = findContactByName(displayName)
 	}
 
-	msg := fmt.Sprintf("[ТЕХНИЧЕСКОЕ] В голосовой канал зашёл участник: %s (discord id %s).",
+	msg := fmt.Sprintf("[ТЕХНИЧЕСКОЕ] В голосовой канал зашёл участник: %s (discord id %s). Неизвестный пользователь.",
 		displayName, userID)
 	if c != nil {
 		msg = fmt.Sprintf("[ТЕХНИЧЕСКОЕ] В голосовой канал зашёл участник: %s (discord id %s). Это %s.",
