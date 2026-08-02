@@ -150,9 +150,26 @@ func (b *bot) processUtterance(vc *discordgo.VoiceConnection, pcm []int16) {
 	b.speak(vc, reply)
 }
 
+// ttsProvider returns the configured TTS provider:
+//   - "edge"   — Microsoft edge-tts only
+//   - "openai" — OpenAI Audio Speech API only
+//   - "auto"   — edge-tts with OpenAI fallback (default)
+//
+// Controlled by the TTS_PROVIDER env var so switching during tests is a
+// one-line change in the service unit + restart, no rebuild needed.
+func ttsProvider() string {
+	p := strings.ToLower(strings.TrimSpace(os.Getenv("TTS_PROVIDER")))
+	switch p {
+	case "edge", "openai", "auto":
+		return p
+	default:
+		return "auto"
+	}
+}
+
 // speak synthesizes text via TTS and plays it into the voice channel.
-// Primary provider is edge-tts; if it fails (Microsoft throttling), the
-// OpenAI Audio Speech API is used as a reliable fallback.
+// Provider is selected by TTS_PROVIDER: edge-tts, OpenAI, or auto
+// (edge-tts primary, OpenAI fallback on Microsoft throttling).
 func (b *bot) speak(vc *discordgo.VoiceConnection, text string) {
 	// Serialize playback: only one stream may write to OpusSend at a time.
 	b.speakMu.Lock()
@@ -163,14 +180,37 @@ func (b *bot) speak(vc *discordgo.VoiceConnection, text string) {
 		return
 	}
 
-	// edge-tts disabled — unreliable (NoAudioReceived, empty mp3).
-	// Kept in tts.go for future re-enablement.
-	audio, err := ttsOpenAI(text)
-	if err != nil {
-		log.Printf("voice: TTS failed: %v", err)
-		return
+	var audio [][]byte
+	var err error
+	switch ttsProvider() {
+	case "edge":
+		audio, err = ttsEdge(text)
+		if err != nil {
+			log.Printf("voice: edge-tts failed: %v", err)
+			return
+		}
+		log.Printf("voice: using edge-tts (Microsoft)")
+	case "openai":
+		audio, err = ttsOpenAI(text)
+		if err != nil {
+			log.Printf("voice: openai tts failed: %v", err)
+			return
+		}
+		log.Printf("voice: using OpenAI TTS")
+	default: // auto
+		audio, err = ttsEdge(text)
+		if err != nil {
+			log.Printf("voice: edge-tts failed, falling back to OpenAI: %v", err)
+			audio, err = ttsOpenAI(text)
+			if err != nil {
+				log.Printf("voice: TTS failed: %v", err)
+				return
+			}
+			log.Printf("voice: using OpenAI TTS (fallback)")
+		} else {
+			log.Printf("voice: using edge-tts (Microsoft)")
+		}
 	}
-	log.Printf("voice: using OpenAI TTS")
 	if len(audio) == 0 {
 		log.Printf("voice: TTS produced no audio")
 		return
