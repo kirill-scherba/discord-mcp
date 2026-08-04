@@ -131,7 +131,7 @@ func isSessionGone(err error) bool {
 // createBrainSession creates a fresh empty session and sends the startup
 // message telling Baron he is in a voice chat.
 func createBrainSession(cl *opencodeclient.Client) (*opencodeclient.Session, error) {
-	sess, err := cl.CreateSession("voice-chat", "baron", "", "", nil)
+	sess, err := cl.CreateSession("voice-chat", "baron", "", "", "discord", nil)
 	if err != nil {
 		return nil, fmt.Errorf("brain: create session: %w", err)
 	}

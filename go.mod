@@ -5,7 +5,7 @@ go 1.26.5
 require (
 	github.com/cartridge-gg/discordgo v0.29.1-dave.25
 	github.com/hraban/opus v0.0.0-20260708213942-bde8e4304501
-	github.com/kirill-scherba/opencode-client v0.1.1
+	github.com/kirill-scherba/opencode-client v0.3.0
 	github.com/mark3labs/mcp-go v0.54.1
 )
 
