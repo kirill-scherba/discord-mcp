@@ -55,8 +55,8 @@ func handlerDiscordSend(ctx context.Context, req mcp.CallToolRequest) (*mcp.Call
 		return mcp.NewToolResultText("Error: Missing required: message"), nil
 	}
 	payload := map[string]any{"content": msg}
-	if username, ok := args["username"].(string); ok && username != "" {
-		payload["username"] = username
+	if agentname, ok := args["agentname"].(string); ok && agentname != "" {
+		payload["username"] = agentname
 	}
 	code, body, err := postWebhook(payload)
 	if err != nil {
