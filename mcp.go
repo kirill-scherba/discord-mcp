@@ -12,8 +12,9 @@ import (
 func tools() []server.ServerTool {
 	return []server.ServerTool{
 		{Tool: mcp.NewTool("discord_send",
-			mcp.WithDescription("Send a simple text message to Discord via webhook."),
+			mcp.WithDescription("Send a simple text message to Discord via webhook. Optional username sets the sender name shown in Discord."),
 			mcp.WithString("message", mcp.Description("Message text to send"), mcp.Required()),
+			mcp.WithString("username", mcp.Description("Sender name shown in Discord (optional)")),
 		), Handler: handlerDiscordSend},
 		{Tool: mcp.NewTool("discord_send_embed",
 			mcp.WithDescription("Send a rich embed message to Discord via webhook. Supports title, description, color, and fields."),
