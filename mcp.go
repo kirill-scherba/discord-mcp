@@ -12,9 +12,9 @@ import (
 func tools() []server.ServerTool {
 	return []server.ServerTool{
 		{Tool: mcp.NewTool("discord_send",
-			mcp.WithDescription("Send a simple text message to Discord via webhook. IMPORTANT: always pass agentname — your own agent name (who you are, e.g. belochka, baron, svetik) — so Kirill sees who sent the message."),
+			mcp.WithDescription("Send a simple text message to Discord via webhook. IMPORTANT: always pass agentname — your OWN agent name, which you can find in your system prompt (your identity, who you are). So Kirill sees who sent the message."),
 			mcp.WithString("message", mcp.Description("Message text to send"), mcp.Required()),
-			mcp.WithString("agentname", mcp.Description("Your agent name shown in Discord (who you are). Always pass it — e.g. belochka, baron, svetik.")),
+			mcp.WithString("agentname", mcp.Description("Your own agent name — find it in your system prompt, in the description of who you are (e.g. if you are Belochka pass 'Белочка 🐿️', if Baron pass 'Барон 🐪🎩'). Always pass it.")),
 		), Handler: handlerDiscordSend},
 		{Tool: mcp.NewTool("discord_send_embed",
 			mcp.WithDescription("Send a rich embed message to Discord via webhook. Supports title, description, color, and fields."),
