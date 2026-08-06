@@ -84,6 +84,9 @@ func ttsYandex(text string) ([][]byte, error) {
 				"containerAudio": map[string]any{"containerAudioType": "MP3"},
 			},
 			"hints": []map[string]any{{"voice": voice}},
+			// unsafe_mode lifts the default 250-char / 24s limit so longer
+			// Baron replies are synthesized in one request.
+			"unsafe_mode": true,
 		}
 		raw, err := json.Marshal(body)
 		if err != nil {
@@ -115,27 +118,42 @@ func ttsYandex(text string) ([][]byte, error) {
 			continue
 		}
 
-		var out struct {
-			Result struct {
-				AudioChunk struct {
-					Data string `json:"data"`
-				} `json:"audioChunk"`
-			} `json:"result"`
-			Error *struct {
-				Message string `json:"message"`
-			} `json:"error"`
+		// The API returns NDJSON: one JSON object per audio chunk (long
+		// texts with unsafe_mode come as multiple chunks). Collect all
+		// audioChunk.data and concatenate the decoded MP3 bytes.
+		var mp3 []byte
+		var streamErr error
+		for _, line := range splitJSONObjects(string(jsonBody)) {
+			var chunk struct {
+				Result struct {
+					AudioChunk struct {
+						Data string `json:"data"`
+					} `json:"audioChunk"`
+				} `json:"result"`
+				Error *struct {
+					Message string `json:"message"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal([]byte(line), &chunk); err != nil {
+				streamErr = err
+				continue
+			}
+			if chunk.Error != nil {
+				streamErr = fmt.Errorf("yandex tts: %s", chunk.Error.Message)
+				continue
+			}
+			if chunk.Result.AudioChunk.Data == "" {
+				continue
+			}
+			part, err := base64.StdEncoding.DecodeString(chunk.Result.AudioChunk.Data)
+			if err != nil {
+				streamErr = fmt.Errorf("yandex tts: base64: %w", err)
+				continue
+			}
+			mp3 = append(mp3, part...)
 		}
-		if err := json.Unmarshal(jsonBody, &out); err != nil {
-			lastErr = err
-			continue
-		}
-		if out.Error != nil {
-			lastErr = fmt.Errorf("yandex tts: %s", out.Error.Message)
-			continue
-		}
-		mp3, err := base64.StdEncoding.DecodeString(out.Result.AudioChunk.Data)
-		if err != nil {
-			lastErr = fmt.Errorf("yandex tts: base64: %w", err)
+		if streamErr != nil {
+			lastErr = streamErr
 			continue
 		}
 		if len(mp3) == 0 {
@@ -149,6 +167,39 @@ func ttsYandex(text string) ([][]byte, error) {
 		return frames, nil
 	}
 	return nil, fmt.Errorf("yandex tts: all voices failed: %w", lastErr)
+}
+
+// splitJSONObjects splits a stream of concatenated JSON objects (NDJSON,
+// no newline separators in the raw response) into individual object strings.
+func splitJSONObjects(s string) []string {
+	var out []string
+	depth := 0
+	start := 0
+	inStr := false
+	escaped := false
+	for i, r := range s {
+		switch {
+		case escaped:
+			escaped = false
+		case inStr && r == '\\':
+			escaped = true
+		case inStr && r == '"':
+			inStr = false
+		case !inStr && r == '"':
+			inStr = true
+		case !inStr && r == '{':
+			if depth == 0 {
+				start = i
+			}
+			depth++
+		case !inStr && r == '}':
+			depth--
+			if depth == 0 {
+				out = append(out, s[start:i+1])
+			}
+		}
+	}
+	return out
 }
 
 // ttsOpenAI synthesizes text via the OpenAI Audio Speech API and returns
