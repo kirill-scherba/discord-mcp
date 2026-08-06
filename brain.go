@@ -240,11 +240,11 @@ func brainNotifyState(action, displayName, userID string, present []string) {
 		who = c.Name
 	}
 
-	actionRu := "зашёл"
+	actionRu := "зашёл в голосовой канал"
 	if action == "leave" {
-		actionRu = "вышел"
+		actionRu = "покинул голосовой канал"
 	}
-	msg := fmt.Sprintf("[ТЕХНИЧЕСКОЕ] В голосовой канал %s участник: %s (discord id %s). Это %s.",
+	msg := fmt.Sprintf("[ТЕХНИЧЕСКОЕ] Участник %s: %s (discord id %s). Это %s.",
 		actionRu, displayName, userID, who)
 	if c != nil && c.Who != "" {
 		msg += " " + c.Who + "."

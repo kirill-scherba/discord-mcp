@@ -21,7 +21,8 @@ const (
 	channels      = 1
 	frameSamples  = 960 // 20 ms at 48 kHz
 	silenceMS     = 500 // end utterance after this much silence
-	maxUtteranceS = 30  // hard cap per utterance
+	maxUtteranceS = 30  // hard cap per utterance; STT downsamples 48->16kHz
+	// so the 1 MB Yandex limit covers ~32s of speech
 	rmsThreshold  = 800 // voice activity threshold (int16); high enough to
 	// ignore background noise, low enough to catch normal speech
 	// minSpeechMS is the minimum continuous speech before an utterance is

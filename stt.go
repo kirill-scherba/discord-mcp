@@ -95,7 +95,9 @@ func sttWhisper(wav []byte) (string, error) {
 
 // sttYandex sends WAV to the Yandex SpeechKit synchronous recognition API
 // and returns the recognized Russian text. The API expects raw LPCM (no WAV
-// header), 48 kHz mono — we strip the 44-byte RIFF header.
+// header), mono. We downsample 48 kHz -> 16 kHz (3:1) before sending: Yandex
+// recognizes 16 kHz fine, and this triples the allowed audio length under the
+// 1 MB request limit (~32s instead of ~10.9s).
 func sttYandex(wav []byte) (string, error) {
 	key := os.Getenv("YANDEX_AI_API_KEY")
 	if key == "" {
@@ -107,17 +109,29 @@ func sttYandex(wav []byte) (string, error) {
 	if len(wav) >= 44 && bytes.Equal(wav[:4], []byte("RIFF")) {
 		lpcm = wav[44:]
 	}
+	// Downsample 48000 -> 16000: take every 3rd int16 sample.
+	// (Linear interpolation between samples would be smoother, but 3:1
+	// decimation is fine for speech recognition.)
+	s16 := lpcm
+	if len(lpcm) > 0 {
+		n := len(lpcm) / 2
+		out := make([]byte, 0, (n/3)*2+2)
+		for i := 0; i < n; i += 3 {
+			out = append(out, lpcm[i*2], lpcm[i*2+1])
+		}
+		s16 = out
+	}
 
 	u := "https://stt.api.cloud.yandex.net/speech/v1/stt:recognize?" + url.Values{
 		"lang":             {"ru-RU"},
 		"topic":            {"general"},
 		"format":           {"lpcm"},
-		"sampleRateHertz":  {"48000"},
+		"sampleRateHertz":  {"16000"},
 		"rawResults":       {"true"},
 		"profanityFilter":  {"false"},
 	}.Encode()
 
-	req, err := http.NewRequest(http.MethodPost, u, bytes.NewReader(lpcm))
+	req, err := http.NewRequest(http.MethodPost, u, bytes.NewReader(s16))
 	if err != nil {
 		return "", err
 	}
