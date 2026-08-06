@@ -171,7 +171,6 @@ func (b *bot) onVoiceStateUpdate(s *discordgo.Session, vs *discordgo.VoiceStateU
 		b.mu.Unlock()
 		return
 	}
-	wasIn := b.usersInChannel[vs.UserID]
 	if vs.ChannelID != "" {
 		b.usersInChannel[vs.UserID] = true
 	} else {
@@ -179,10 +178,11 @@ func (b *bot) onVoiceStateUpdate(s *discordgo.Session, vs *discordgo.VoiceStateU
 	}
 	b.mu.Unlock()
 
-	// A new participant connected: tell Baron who it is.
-	if vs.ChannelID != "" && !wasIn {
-		go b.notifyJoined(s, vs.UserID)
-	}
+	// Participant join greeting is disabled: it fired on mic toggles and
+	// wasn't needed. notifyJoined/brainNotifyContact remain for re-enable.
+	// if vs.ChannelID != "" && !wasIn {
+	// 	go b.notifyJoined(s, vs.UserID)
+	// }
 }
 
 // notifyJoined resolves the user's display name and passes it to Baron.

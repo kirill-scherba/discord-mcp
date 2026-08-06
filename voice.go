@@ -22,7 +22,12 @@ const (
 	frameSamples  = 960 // 20 ms at 48 kHz
 	silenceMS     = 400 // end utterance after this much silence
 	maxUtteranceS = 30  // hard cap per utterance
-	rmsThreshold  = 300 // voice activity threshold (int16)
+	rmsThreshold  = 800 // voice activity threshold (int16); high enough to
+	// ignore background noise, low enough to catch normal speech
+	// minSpeechMS is the minimum continuous speech before an utterance is
+	// considered real (filters out noise blips that would otherwise be sent
+	// to STT and billed).
+	minSpeechMS = 600
 )
 
 // speaking flag prevents the bot from recording its own TTS playback.
@@ -30,6 +35,22 @@ func (b *bot) isSpeakingNow() bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.ttsSpeaking
+}
+
+// wasBusyAt reports whether the bot was busy (speaking or processing a
+// previous utterance) at the given time. Used to reject utterance tails that
+// were recorded while the bot was replying.
+func (b *bot) wasBusyAt(t time.Time) bool {
+	if b.isSpeakingNow() {
+		return true
+	}
+	// If processMu is locked right now, a previous utterance is still being
+	// processed — a phrase that started recently is likely its tail.
+	if !b.processMu.TryLock() {
+		return true
+	}
+	b.processMu.Unlock()
+	return false
 }
 
 func (b *bot) setTTSSpeaking(v bool) {
@@ -49,6 +70,7 @@ func (b *bot) recordingLoop(vc *discordgo.VoiceConnection, guildID, channelID st
 
 	var pcm []int16
 	var lastSpeech time.Time
+	var speechStart time.Time
 	active := false
 
 	log.Printf("voice: recording loop started in %s", channelID)
@@ -82,6 +104,7 @@ func (b *bot) recordingLoop(vc *discordgo.VoiceConnection, guildID, channelID st
 				lastSpeech = time.Now()
 				if !active {
 					active = true
+					speechStart = time.Now()
 				}
 			} else if active {
 				pcm = append(pcm, frame...)
@@ -92,7 +115,7 @@ func (b *bot) recordingLoop(vc *discordgo.VoiceConnection, guildID, channelID st
 				utterance := pcm
 				pcm = nil
 				active = false
-				go b.processUtterance(vc, utterance)
+				go b.processUtterance(vc, utterance, speechStart)
 			}
 
 		case <-time.After(5 * time.Second):
@@ -101,7 +124,7 @@ func (b *bot) recordingLoop(vc *discordgo.VoiceConnection, guildID, channelID st
 				utterance := pcm
 				pcm = nil
 				active = false
-				go b.processUtterance(vc, utterance)
+				go b.processUtterance(vc, utterance, speechStart)
 			}
 		}
 	}
@@ -122,7 +145,6 @@ func (b *bot) recordingLoopStream(vc *discordgo.VoiceConnection, guildID, channe
 	var chunk []int16
 	chunkN := 0
 	active := false
-	var lastSpeech time.Time
 
 	log.Printf("voice: streaming recording loop started in %s", channelID)
 
@@ -147,8 +169,20 @@ func (b *bot) recordingLoopStream(vc *discordgo.VoiceConnection, guildID, channe
 	}
 
 	for {
-		// If the bot is currently speaking, drain packets and skip recording.
+		// While the bot speaks, pause streaming entirely: close any active
+		// stream and drain incoming packets. This avoids concurrent UDP
+		// read/write on the voice socket (opusSender vs opusReceiver) which
+		// deadlocks DAVE encryption. The user simply cannot talk while the
+		// bot is replying; after playback ends, streaming resumes.
 		if b.isSpeakingNow() {
+			if s != nil {
+				log.Printf("voice: pausing stream (bot speaking)")
+				s.close()
+				s = nil
+				chunk = nil
+				chunkN = 0
+				active = false
+			}
 			for len(vc.OpusRecv) > 0 {
 				<-vc.OpusRecv
 			}
@@ -184,7 +218,6 @@ func (b *bot) recordingLoopStream(vc *discordgo.VoiceConnection, guildID, channe
 					go readStream(s)
 				}
 				active = true
-				lastSpeech = time.Now()
 				chunk = append(chunk, frame...)
 				chunkN++
 				// Push every streamChunkFrames frames (~100ms).
@@ -236,16 +269,19 @@ func (b *bot) recordingLoopStream(vc *discordgo.VoiceConnection, guildID, channe
 			chunkN = 0
 			active = false
 
-		case <-time.After(streamFlushAfter):
-			// Safety net: if the server never sent eou but speech stopped,
-			// close the stream so a new utterance can start.
-			if active && s != nil && time.Since(lastSpeech) > streamFlushAfter {
-				log.Printf("voice: stream flush (no eou), closing")
-				s.close()
-				s = nil
-				chunk = nil
-				chunkN = 0
-				active = false
+		case <-time.After(streamSilenceInterval):
+			// No Discord packets for a while: the user stopped talking.
+			// Tell the server about the silence so it emits eou_update for
+			// the completed utterance, instead of hanging until timeout.
+			if active && s != nil {
+				if serr := s.sendSilence(streamSilenceInterval.Milliseconds()); serr != nil {
+					log.Printf("voice: stream silence: %v", serr)
+					s.close()
+					s = nil
+					chunk = nil
+					chunkN = 0
+					active = false
+				}
 			}
 		}
 	}
@@ -254,7 +290,9 @@ func (b *bot) recordingLoopStream(vc *discordgo.VoiceConnection, guildID, channe
 // processStreamText runs brain -> TTS for a text already recognized by the
 // streaming STT (no STT step, it happened during recording).
 func (b *bot) processStreamText(vc *discordgo.VoiceConnection, text string) {
+	log.Printf("voice: processStreamText start: %q", text)
 	b.processMu.Lock()
+	log.Printf("voice: processStreamText got processMu")
 	defer b.processMu.Unlock()
 
 	phaseStart := time.Now()
@@ -283,13 +321,38 @@ func (b *bot) processStreamText(vc *discordgo.VoiceConnection, text string) {
 // Serialized via processMu: while one utterance is being processed (including
 // TTS playback), the next one waits. This prevents two replies from being
 // synthesized and played at the same time.
-func (b *bot) processUtterance(vc *discordgo.VoiceConnection, pcm []int16) {
-	b.processMu.Lock()
-	defer b.processMu.Unlock()
-
-	if len(pcm) < sampleRate/4 { // ignore sub-250ms blips
+func (b *bot) processUtterance(vc *discordgo.VoiceConnection, pcm []int16, speechStart time.Time) {
+	// Tail rejection: if the bot was speaking (or processing) when this
+	// utterance started, it is the tail of a phrase already split by the
+	// silence timer — drop it. The user cannot interrupt the bot anyway.
+	if b.wasBusyAt(speechStart) {
+		log.Printf("voice: tail dropped (bot was busy at speech start)")
 		return
 	}
+
+	// Check BEFORE taking processMu: while waiting for the mutex, elapsed
+	// time keeps growing and would let short noise pass the duration check.
+	speechMS := time.Since(speechStart).Milliseconds()
+	if speechMS < minSpeechMS {
+		log.Printf("voice: short utterance (%dms) skipped", speechMS)
+		return
+	}
+
+	// Ignore tiny PCM buffers (noise blips) regardless of elapsed time.
+	if len(pcm) < sampleRate/4 { // ignore sub-250ms blips
+		log.Printf("voice: tiny utterance (%d bytes) skipped", len(pcm)*2)
+		return
+	}
+
+	// Energy gate: even if VAD fired, reject very quiet buffers (breath,
+	// mic rustle) that would just be billed as empty STT.
+	if avgRMS(pcm) < rmsThreshold*0.6 {
+		log.Printf("voice: low-energy utterance skipped (avgRms=%.0f)", avgRMS(pcm))
+		return
+	}
+
+	b.processMu.Lock()
+	defer b.processMu.Unlock()
 
 	// Phase timing so the log shows exactly where the pipeline spends time.
 	phaseStart := time.Now()
@@ -307,6 +370,7 @@ func (b *bot) processUtterance(vc *discordgo.VoiceConnection, pcm []int16) {
 	step("stt")
 	text = trimWhitespace(text)
 	if text == "" {
+		log.Printf("voice: STT empty (noise), %dms audio, skipping", len(pcm)/sampleRate*1000)
 		return
 	}
 	// Filter known Whisper hallucinations on silence/noise.
@@ -315,6 +379,7 @@ func (b *bot) processUtterance(vc *discordgo.VoiceConnection, pcm []int16) {
 		return
 	}
 	log.Printf("voice: heard: %q", text)
+	log.Printf("voice: heard pcm=%dms", len(pcm)/sampleRate*1000)
 
 	reply, err := brainAsk(text)
 	if err != nil {
@@ -357,6 +422,8 @@ func (b *bot) speak(vc *discordgo.VoiceConnection, text string) {
 	// Serialize playback: only one stream may write to OpusSend at a time.
 	b.speakMu.Lock()
 	defer b.speakMu.Unlock()
+
+	log.Printf("voice: speak start")
 
 	if vc == nil || !vc.Ready {
 		log.Printf("voice: not ready, cannot speak")
@@ -462,6 +529,19 @@ func rmsInt16(frame []int16) float64 {
 		sum += float64(s) * float64(s)
 	}
 	return math.Sqrt(sum / float64(len(frame)))
+}
+
+// avgRMS computes the average RMS over a whole buffer (used as an energy gate
+// before sending to STT).
+func avgRMS(pcm []int16) float64 {
+	if len(pcm) == 0 {
+		return 0
+	}
+	var sum float64
+	for _, s := range pcm {
+		sum += float64(s) * float64(s)
+	}
+	return math.Sqrt(sum / float64(len(pcm)))
 }
 
 func trimWhitespace(s string) string {

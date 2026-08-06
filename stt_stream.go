@@ -30,10 +30,10 @@ const yandexStreamEndpoint = "stt.api.cloud.yandex.net:443"
 // = 100ms of audio per message — a good balance of latency vs overhead.
 const streamChunkFrames = 5
 
-// streamFlushAfter is how long the server keeps a partial utterance alive
-// without audio before we consider it ended (safety net; the server normally
-// sends eou_update itself).
-const streamFlushAfter = 2 * time.Second
+// streamSilenceInterval is how often the bot sends a SilenceChunk to the
+// server while the user is not talking, so the server emits eou_update for
+// the completed utterance instead of hanging until the idle timeout.
+const streamSilenceInterval = 800 * time.Millisecond
 
 // sttStream is one active streaming recognition session.
 type sttStream struct {
@@ -137,13 +137,34 @@ func (s *sttStream) sendPCM(pcm []int16) error {
 	return nil
 }
 
-// recvResult reads one server message. Returns (finalText, ended, err):
-//   - finalText: the recognized text accumulated so far
-//   - ended: true if the server signaled endOfUtterance (utterance complete)
-func (s *sttStream) recvResult() (string, bool, error) {
+// sendSilence tells the server the user has gone quiet. The server treats it
+// as a pause and emits eou_update for the completed utterance. Used when the
+// bot stops receiving Discord packets (user stopped talking) so the stream
+// doesn't hang until the idle timeout.
+func (s *sttStream) sendSilence(ms int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if err := s.stream.Send(&sttv3.StreamingRequest{
+		Event: &sttv3.StreamingRequest_SilenceChunk{
+			SilenceChunk: &sttv3.SilenceChunk{DurationMs: ms},
+		},
+	}); err != nil {
+		return fmt.Errorf("yandex stream: send silence: %w", err)
+	}
+	s.lastAudio = time.Now()
+	return nil
+}
+
+// recvResult reads one server message. Returns (finalText, ended, err):
+//   - finalText: the recognized text accumulated so far
+//   - ended: true if the server signaled endOfUtterance (utterance complete)
+//
+// NOTE: Recv() blocks until the server sends something, so it must NOT hold
+// s.mu — otherwise sendPCM (which takes the same mutex) would deadlock and no
+// audio would ever be sent. finalText is only written here, read in the same
+// goroutine, so no locking is needed for it.
+func (s *sttStream) recvResult() (string, bool, error) {
 	resp, err := s.stream.Recv()
 	if err != nil {
 		return s.finalText, false, fmt.Errorf("yandex stream: recv: %w", err)

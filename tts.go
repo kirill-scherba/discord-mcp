@@ -84,9 +84,13 @@ func ttsYandex(text string) ([][]byte, error) {
 				"containerAudio": map[string]any{"containerAudioType": "MP3"},
 			},
 			"hints": []map[string]any{{"voice": voice}},
-			// unsafe_mode lifts the default 250-char / 24s limit so longer
-			// Baron replies are synthesized in one request.
-			"unsafe_mode": true,
+		}
+		// unsafe_mode lifts the default 250-char / 24s limit, but it also
+		// makes Yandex split the text into chunks and synthesize each one
+		// separately, which flattens intonation and sounds "mechanical".
+		// Enable it ONLY for long texts; short replies keep natural prosody.
+		if len(text) > 250 {
+			body["unsafe_mode"] = true
 		}
 		raw, err := json.Marshal(body)
 		if err != nil {
