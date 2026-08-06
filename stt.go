@@ -17,14 +17,15 @@ import (
 	"strings"
 )
 // sttProvider returns the configured STT provider:
-//   - "whisper" — OpenAI whisper (default)
-//   - "yandex"  — Yandex SpeechKit
+//   - "whisper"      — OpenAI whisper (default)
+//   - "yandex"       — Yandex SpeechKit synchronous
+//   - "yandex-stream"— Yandex SpeechKit streaming (no phrase splitting)
 //
 // Controlled by the STT_PROVIDER env var.
 func sttProvider() string {
 	p := strings.ToLower(strings.TrimSpace(os.Getenv("STT_PROVIDER")))
 	switch p {
-	case "whisper", "yandex":
+	case "whisper", "yandex", "yandex-stream":
 		return p
 	default:
 		return "whisper"

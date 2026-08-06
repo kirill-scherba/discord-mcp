@@ -274,7 +274,11 @@ func (b *bot) joinVoice(s *discordgo.Session, guildID, channelID string) error {
 	b.mu.Unlock()
 
 	log.Printf("discord-bot: joined voice channel %s", channelID)
-	go b.recordingLoop(vc, guildID, channelID)
+	if sttProvider() == "yandex-stream" {
+		go b.recordingLoopStream(vc, guildID, channelID)
+	} else {
+		go b.recordingLoop(vc, guildID, channelID)
+	}
 	return nil
 }
 

@@ -107,6 +107,178 @@ func (b *bot) recordingLoop(vc *discordgo.VoiceConnection, guildID, channelID st
 	}
 }
 
+// recordingLoopStream is the streaming STT variant (STT_PROVIDER=yandex-stream).
+// Instead of waiting for a silence timer, PCM chunks are pushed to the Yandex
+// streaming API while the user speaks; the server signals endOfUtterance when
+// the phrase is complete, so pauses inside a phrase no longer split it.
+func (b *bot) recordingLoopStream(vc *discordgo.VoiceConnection, guildID, channelID string) {
+	dec, err := opus.NewDecoder(sampleRate, channels)
+	if err != nil {
+		log.Printf("voice: opus decoder: %v", err)
+		return
+	}
+
+	var s *sttStream
+	var chunk []int16
+	chunkN := 0
+	active := false
+	var lastSpeech time.Time
+
+	log.Printf("voice: streaming recording loop started in %s", channelID)
+
+	// results feeds final/eou events from the stream reader goroutine.
+	results := make(chan string, 4)
+	streamDone := make(chan struct{})
+
+	// readStream drains server responses; on eou sends the final text.
+	readStream := func(st *sttStream) {
+		defer close(streamDone)
+		for {
+			text, ended, rerr := st.recvResult()
+			if rerr != nil {
+				log.Printf("voice: stream recv: %v", rerr)
+				return
+			}
+			if ended {
+				results <- text
+				return
+			}
+		}
+	}
+
+	for {
+		// If the bot is currently speaking, drain packets and skip recording.
+		if b.isSpeakingNow() {
+			for len(vc.OpusRecv) > 0 {
+				<-vc.OpusRecv
+			}
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+
+		select {
+		case p, ok := <-vc.OpusRecv:
+			if !ok {
+				log.Printf("voice: OpusRecv closed")
+				if s != nil {
+					s.close()
+				}
+				return
+			}
+			frame := make([]int16, frameSamples)
+			n, derr := dec.Decode(p.Opus, frame)
+			if derr != nil || n == 0 {
+				continue
+			}
+			frame = frame[:n]
+
+			rms := rmsInt16(frame)
+			if rms > rmsThreshold {
+				// Speech started: open the stream once.
+				if s == nil {
+					s, err = startYandexStream()
+					if err != nil {
+						log.Printf("voice: stream start failed: %v", err)
+						return
+					}
+					go readStream(s)
+				}
+				active = true
+				lastSpeech = time.Now()
+				chunk = append(chunk, frame...)
+				chunkN++
+				// Push every streamChunkFrames frames (~100ms).
+				if chunkN >= streamChunkFrames {
+					if serr := s.sendPCM(chunk); serr != nil {
+						log.Printf("voice: stream send: %v", serr)
+						s.close()
+						s = nil
+						chunk = nil
+						chunkN = 0
+						active = false
+					}
+					chunk = nil
+					chunkN = 0
+				}
+			} else if active {
+				// Silence while streaming: still send it so the server sees
+				// the pause and eventually emits eou_update.
+				chunk = append(chunk, frame...)
+				chunkN++
+				if chunkN >= streamChunkFrames {
+					if serr := s.sendPCM(chunk); serr != nil {
+						log.Printf("voice: stream send: %v", serr)
+						s.close()
+						s = nil
+						chunk = nil
+						chunkN = 0
+						active = false
+					}
+					chunk = nil
+					chunkN = 0
+				}
+			}
+
+		case text := <-results:
+			// End of utterance from the server.
+			text = trimWhitespace(text)
+			if text != "" && !isGarbageSTT(text) {
+				log.Printf("voice: [stream] eou: %q", text)
+				go b.processStreamText(vc, text)
+			} else {
+				log.Printf("voice: [stream] eou empty/garbage, skipped")
+			}
+			if s != nil {
+				s.close()
+				s = nil
+			}
+			chunk = nil
+			chunkN = 0
+			active = false
+
+		case <-time.After(streamFlushAfter):
+			// Safety net: if the server never sent eou but speech stopped,
+			// close the stream so a new utterance can start.
+			if active && s != nil && time.Since(lastSpeech) > streamFlushAfter {
+				log.Printf("voice: stream flush (no eou), closing")
+				s.close()
+				s = nil
+				chunk = nil
+				chunkN = 0
+				active = false
+			}
+		}
+	}
+}
+
+// processStreamText runs brain -> TTS for a text already recognized by the
+// streaming STT (no STT step, it happened during recording).
+func (b *bot) processStreamText(vc *discordgo.VoiceConnection, text string) {
+	b.processMu.Lock()
+	defer b.processMu.Unlock()
+
+	phaseStart := time.Now()
+	step := func(name string) {
+		log.Printf("voice: [phase] %s: %dms", name, time.Since(phaseStart).Milliseconds())
+		phaseStart = time.Now()
+	}
+
+	reply, err := brainAsk(text)
+	if err != nil {
+		log.Printf("voice: brain failed: %v", err)
+		return
+	}
+	step("brain")
+	reply = trimWhitespace(reply)
+	if reply == "" {
+		return
+	}
+	log.Printf("voice: reply: %q", reply)
+
+	b.speak(vc, reply)
+	step("tts-play")
+}
+
 // processUtterance runs STT -> brain -> TTS for a single recorded utterance.
 // Serialized via processMu: while one utterance is being processed (including
 // TTS playback), the next one waits. This prevents two replies from being
