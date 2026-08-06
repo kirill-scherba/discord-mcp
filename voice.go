@@ -153,6 +153,7 @@ func (b *bot) processUtterance(vc *discordgo.VoiceConnection, pcm []int16) {
 // ttsProvider returns the configured TTS provider:
 //   - "edge"   — Microsoft edge-tts only
 //   - "openai" — OpenAI Audio Speech API only
+//   - "yandex" — Yandex SpeechKit only
 //   - "auto"   — edge-tts with OpenAI fallback (default)
 //
 // Controlled by the TTS_PROVIDER env var so switching during tests is a
@@ -160,7 +161,7 @@ func (b *bot) processUtterance(vc *discordgo.VoiceConnection, pcm []int16) {
 func ttsProvider() string {
 	p := strings.ToLower(strings.TrimSpace(os.Getenv("TTS_PROVIDER")))
 	switch p {
-	case "edge", "openai", "auto":
+	case "edge", "openai", "yandex", "auto":
 		return p
 	default:
 		return "auto"
@@ -168,7 +169,7 @@ func ttsProvider() string {
 }
 
 // speak synthesizes text via TTS and plays it into the voice channel.
-// Provider is selected by TTS_PROVIDER: edge-tts, OpenAI, or auto
+// Provider is selected by TTS_PROVIDER: edge-tts, OpenAI, Yandex, or auto
 // (edge-tts primary, OpenAI fallback on Microsoft throttling).
 func (b *bot) speak(vc *discordgo.VoiceConnection, text string) {
 	// Serialize playback: only one stream may write to OpusSend at a time.
@@ -197,6 +198,13 @@ func (b *bot) speak(vc *discordgo.VoiceConnection, text string) {
 			return
 		}
 		log.Printf("voice: using OpenAI TTS")
+	case "yandex":
+		audio, err = ttsYandex(text)
+		if err != nil {
+			log.Printf("voice: yandex tts failed: %v", err)
+			return
+		}
+		log.Printf("voice: using Yandex TTS")
 	default: // auto
 		audio, err = ttsEdge(text)
 		if err != nil {

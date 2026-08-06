@@ -1,13 +1,16 @@
-// tts.go — text-to-speech with two providers:
-//  1. edge-tts (Microsoft Edge cloud voices, free) — primary
-//  2. OpenAI Audio Speech API (tts-1) — reliable fallback
+// tts.go — text-to-speech with three providers:
+//  1. edge-tts (Microsoft Edge cloud voices, free)
+//  2. OpenAI Audio Speech API (tts-1)
+//  3. Yandex SpeechKit TTS (API v3)
 //
-// Both produce mp3; the shared pipeline converts to Opus frames for Discord
+// All produce mp3; the shared pipeline converts to Opus frames for Discord
 // voice playback: mp3 -> ffmpeg (s16le 48kHz mono PCM) -> Opus frames.
+// Provider is selected at runtime via TTS_PROVIDER env var (see ttsProvider).
 package main
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -60,10 +63,97 @@ func ttsEdge(text string) ([][]byte, error) {
 	return mp3ToOpusFrames(mp3)
 }
 
+// yandexVoices lists Yandex SpeechKit voices for Baron, in order. kirill is
+// a male Russian voice; filipp is the premium male voice.
+var yandexVoices = []string{"kirill", "filipp", "anton", "marina"}
+
+// ttsYandex synthesizes text via the Yandex SpeechKit TTS API v3 and returns
+// Opus frames. Uses YANDEX_AI_API_KEY (service account API key). The API
+// returns JSON with base64-encoded audio in result.audioChunk.data.
+func ttsYandex(text string) ([][]byte, error) {
+	key := os.Getenv("YANDEX_AI_API_KEY")
+	if key == "" {
+		return nil, fmt.Errorf("YANDEX_AI_API_KEY not set")
+	}
+
+	var lastErr error
+	for _, voice := range yandexVoices {
+		body := map[string]any{
+			"text": text,
+			"outputAudioSpec": map[string]any{
+				"containerAudio": map[string]any{"containerAudioType": "MP3"},
+			},
+			"hints": []map[string]any{{"voice": voice}},
+		}
+		raw, err := json.Marshal(body)
+		if err != nil {
+			return nil, err
+		}
+
+		req, err := http.NewRequest(http.MethodPost,
+			"https://tts.api.cloud.yandex.net/tts/v3/utteranceSynthesis",
+			bytes.NewReader(raw))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Api-Key "+key)
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := openAITTSClient.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		jsonBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 5<<20))
+		resp.Body.Close()
+		if readErr != nil {
+			lastErr = readErr
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			lastErr = fmt.Errorf("yandex tts HTTP %d: %s", resp.StatusCode, truncate(string(jsonBody), 200))
+			continue
+		}
+
+		var out struct {
+			Result struct {
+				AudioChunk struct {
+					Data string `json:"data"`
+				} `json:"audioChunk"`
+			} `json:"result"`
+			Error *struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal(jsonBody, &out); err != nil {
+			lastErr = err
+			continue
+		}
+		if out.Error != nil {
+			lastErr = fmt.Errorf("yandex tts: %s", out.Error.Message)
+			continue
+		}
+		mp3, err := base64.StdEncoding.DecodeString(out.Result.AudioChunk.Data)
+		if err != nil {
+			lastErr = fmt.Errorf("yandex tts: base64: %w", err)
+			continue
+		}
+		if len(mp3) == 0 {
+			lastErr = fmt.Errorf("yandex tts: empty audio")
+			continue
+		}
+		frames, err := mp3ToOpusFrames(mp3)
+		if err != nil {
+			return nil, fmt.Errorf("yandex tts: %w", err)
+		}
+		return frames, nil
+	}
+	return nil, fmt.Errorf("yandex tts: all voices failed: %w", lastErr)
+}
+
 // ttsOpenAI synthesizes text via the OpenAI Audio Speech API and returns
 // Opus frames. Uses OPENAI_API_KEY (same key as STT).
-func ttsOpenAI(text string) ([][]byte, error) {
-	key := os.Getenv("OPENAI_API_KEY")
+func ttsOpenAI(text string) ([][]byte, error) {	key := os.Getenv("OPENAI_API_KEY")
 	if key == "" {
 		return nil, fmt.Errorf("OPENAI_API_KEY not set")
 	}
