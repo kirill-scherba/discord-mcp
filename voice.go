@@ -119,12 +119,20 @@ func (b *bot) processUtterance(vc *discordgo.VoiceConnection, pcm []int16) {
 		return
 	}
 
+	// Phase timing so the log shows exactly where the pipeline spends time.
+	phaseStart := time.Now()
+	step := func(name string) {
+		log.Printf("voice: [phase] %s: %dms", name, time.Since(phaseStart).Milliseconds())
+		phaseStart = time.Now()
+	}
+
 	wav := pcmToWAV(pcm)
 	text, err := transcribe(wav)
 	if err != nil {
 		log.Printf("voice: STT failed: %v", err)
 		return
 	}
+	step("stt")
 	text = trimWhitespace(text)
 	if text == "" {
 		return
@@ -141,6 +149,7 @@ func (b *bot) processUtterance(vc *discordgo.VoiceConnection, pcm []int16) {
 		log.Printf("voice: brain failed: %v", err)
 		return
 	}
+	step("brain")
 	reply = trimWhitespace(reply)
 	if reply == "" {
 		return
@@ -148,6 +157,7 @@ func (b *bot) processUtterance(vc *discordgo.VoiceConnection, pcm []int16) {
 	log.Printf("voice: reply: %q", reply)
 
 	b.speak(vc, reply)
+	step("tts-play")
 }
 
 // ttsProvider returns the configured TTS provider:
@@ -183,6 +193,8 @@ func (b *bot) speak(vc *discordgo.VoiceConnection, text string) {
 
 	var audio [][]byte
 	var err error
+	// synthStart measures only the TTS synthesis call (no playback).
+	synthStart := time.Now()
 	switch ttsProvider() {
 	case "edge":
 		audio, err = ttsEdge(text)
@@ -219,6 +231,7 @@ func (b *bot) speak(vc *discordgo.VoiceConnection, text string) {
 			log.Printf("voice: using edge-tts (Microsoft)")
 		}
 	}
+	log.Printf("voice: [phase] tts-synth: %dms", time.Since(synthStart).Milliseconds())
 	if len(audio) == 0 {
 		log.Printf("voice: TTS produced no audio")
 		return
