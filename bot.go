@@ -40,6 +40,11 @@ type bot struct {
 	channelID string
 	listening bool
 	ttsSpeaking bool
+	// busy is set when an utterance has been sent for processing (STT ->
+	// brain -> TTS). While busy, incoming audio is discarded (it is either
+	// the tail of the phrase being processed or speech that cannot interrupt
+	// the bot anyway). Cleared after playback finishes.
+	busy bool
 
 	// processMu serializes the STT -> brain -> TTS pipeline so replies
 	// never overlap. speakMu guards the OpusSend writer against concurrent
@@ -164,29 +169,36 @@ func (b *bot) onMessageCreate(s *discordgo.Session, m *discordgo.MessageCreate) 
 }
 
 // onVoiceStateUpdate tracks which users are in the voice channel and notifies
-// Baron when a new participant joins.
+// Baron when a participant joins or leaves, including the current roster.
 func (b *bot) onVoiceStateUpdate(s *discordgo.Session, vs *discordgo.VoiceStateUpdate) {
 	b.mu.Lock()
 	if vs.UserID == s.State.User.ID {
 		b.mu.Unlock()
 		return
 	}
+	wasIn := b.usersInChannel[vs.UserID]
 	if vs.ChannelID != "" {
 		b.usersInChannel[vs.UserID] = true
 	} else {
 		delete(b.usersInChannel, vs.UserID)
 	}
+	present := make([]string, 0, len(b.usersInChannel))
+	for uid := range b.usersInChannel {
+		present = append(present, uid)
+	}
 	b.mu.Unlock()
 
-	// Participant join greeting is disabled: it fired on mic toggles and
-	// wasn't needed. notifyJoined/brainNotifyContact remain for re-enable.
-	// if vs.ChannelID != "" && !wasIn {
-	// 	go b.notifyJoined(s, vs.UserID)
-	// }
+	// Notify Baron (technical message, not spoken aloud) on real join/leave,
+	// not on mic toggles (mic toggle keeps ChannelID non-empty).
+	if vs.ChannelID != "" && !wasIn {
+		go b.notifyJoined(s, vs.UserID, present)
+	} else if vs.ChannelID == "" && wasIn {
+		go b.notifyLeft(s, vs.UserID, present)
+	}
 }
 
 // notifyJoined resolves the user's display name and passes it to Baron.
-func (b *bot) notifyJoined(s *discordgo.Session, userID string) {
+func (b *bot) notifyJoined(s *discordgo.Session, userID string, present []string) {
 	display := userID
 	if u, err := s.User(userID); err == nil {
 		display = u.Username
@@ -195,7 +207,20 @@ func (b *bot) notifyJoined(s *discordgo.Session, userID string) {
 		}
 	}
 	log.Printf("discord-bot: participant joined: %s (%s)", display, userID)
-	brainNotifyContact(display, userID)
+	brainNotifyState("join", display, userID, present)
+}
+
+// notifyLeft resolves the user's display name and passes it to Baron.
+func (b *bot) notifyLeft(s *discordgo.Session, userID string, present []string) {
+	display := userID
+	if u, err := s.User(userID); err == nil {
+		display = u.Username
+		if u.GlobalName != "" {
+			display = u.GlobalName
+		}
+	}
+	log.Printf("discord-bot: participant left: %s (%s)", display, userID)
+	brainNotifyState("leave", display, userID, present)
 }
 
 // onVoiceSpeakingUpdate is wired here for speaker-ID (Level 1). Actual audio

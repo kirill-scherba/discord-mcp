@@ -20,7 +20,7 @@ const (
 	sampleRate    = 48000
 	channels      = 1
 	frameSamples  = 960 // 20 ms at 48 kHz
-	silenceMS     = 400 // end utterance after this much silence
+	silenceMS     = 500 // end utterance after this much silence
 	maxUtteranceS = 30  // hard cap per utterance
 	rmsThreshold  = 800 // voice activity threshold (int16); high enough to
 	// ignore background noise, low enough to catch normal speech
@@ -28,6 +28,9 @@ const (
 	// considered real (filters out noise blips that would otherwise be sent
 	// to STT and billed).
 	minSpeechMS = 600
+	// minTailSpeechMS: utterances shorter than this that started while the
+	// bot was busy are treated as tails and dropped; longer ones are kept.
+	minTailSpeechMS = 2000
 )
 
 // speaking flag prevents the bot from recording its own TTS playback.
@@ -35,6 +38,21 @@ func (b *bot) isSpeakingNow() bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.ttsSpeaking
+}
+
+// isBusy reports whether an utterance is being processed (STT/brain/TTS).
+func (b *bot) isBusy() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.busy
+}
+
+// setBusy marks the pipeline as busy (utterance in flight). While busy the
+// recording loop discards all incoming audio.
+func (b *bot) setBusy(v bool) {
+	b.mu.Lock()
+	b.busy = v
+	b.mu.Unlock()
 }
 
 // wasBusyAt reports whether the bot was busy (speaking or processing a
@@ -76,8 +94,10 @@ func (b *bot) recordingLoop(vc *discordgo.VoiceConnection, guildID, channelID st
 	log.Printf("voice: recording loop started in %s", channelID)
 
 	for {
-		// If the bot is currently speaking, drain packets and skip recording.
-		if b.isSpeakingNow() {
+		// While an utterance is being processed (STT/brain/TTS), discard all
+		// incoming audio: it is either the tail of the phrase in flight or
+		// speech that cannot interrupt the bot anyway.
+		if b.isBusy() {
 			for len(vc.OpusRecv) > 0 {
 				<-vc.OpusRecv
 			}
@@ -115,6 +135,10 @@ func (b *bot) recordingLoop(vc *discordgo.VoiceConnection, guildID, channelID st
 				utterance := pcm
 				pcm = nil
 				active = false
+				// Mark busy BEFORE launching: from this instant all incoming
+				// audio (the phrase tail, anything said during processing) is
+				// discarded until the reply has been played.
+				b.setBusy(true)
 				go b.processUtterance(vc, utterance, speechStart)
 			}
 
@@ -124,6 +148,7 @@ func (b *bot) recordingLoop(vc *discordgo.VoiceConnection, guildID, channelID st
 				utterance := pcm
 				pcm = nil
 				active = false
+				b.setBusy(true)
 				go b.processUtterance(vc, utterance, speechStart)
 			}
 		}
@@ -322,10 +347,17 @@ func (b *bot) processStreamText(vc *discordgo.VoiceConnection, text string) {
 // TTS playback), the next one waits. This prevents two replies from being
 // synthesized and played at the same time.
 func (b *bot) processUtterance(vc *discordgo.VoiceConnection, pcm []int16, speechStart time.Time) {
+	// busy was set before this goroutine started; clear it on every exit
+	// (tail/noise drops, errors, or after the reply has been played).
+	defer b.setBusy(false)
+
 	// Tail rejection: if the bot was speaking (or processing) when this
-	// utterance started, it is the tail of a phrase already split by the
-	// silence timer — drop it. The user cannot interrupt the bot anyway.
-	if b.wasBusyAt(speechStart) {
+	// utterance started, and the utterance is SHORT, it is the tail of a
+	// phrase already split by the silence timer — drop it. Long utterances
+	// (>= minTailSpeechMS) are kept even if they started while the bot was
+	// busy: the user is clearly saying a new, full phrase.
+	if b.wasBusyAt(speechStart) &&
+		time.Since(speechStart) < minTailSpeechMS*time.Millisecond {
 		log.Printf("voice: tail dropped (bot was busy at speech start)")
 		return
 	}
@@ -350,6 +382,10 @@ func (b *bot) processUtterance(vc *discordgo.VoiceConnection, pcm []int16, speec
 		log.Printf("voice: low-energy utterance skipped (avgRms=%.0f)", avgRMS(pcm))
 		return
 	}
+
+	// Feedback click: the phrase passed all filters and is being processed.
+	// Play a short "tack" (low tone) so the user knows their voice was accepted.
+	b.playClick(vc, 1200, 6000)
 
 	b.processMu.Lock()
 	defer b.processMu.Unlock()
@@ -393,8 +429,66 @@ func (b *bot) processUtterance(vc *discordgo.VoiceConnection, pcm []int16, speec
 	}
 	log.Printf("voice: reply: %q", reply)
 
+	// Second click (higher tone): the reply is ready, about to be spoken.
+	// Splits the wait into two known phases so the user knows it's working.
+	b.playClick(vc, 1800, 6000)
+
 	b.speak(vc, reply)
 	step("tts-play")
+}
+
+// playClick plays a short feedback tone ("tack") into the voice channel.
+// It tells the user their phrase was accepted and is being processed.
+// freq/amp select the tone: first click is lower (accepted), second is
+// higher (reply ready) so the two phases are distinguishable.
+func (b *bot) playClick(vc *discordgo.VoiceConnection, freq, amp float64) {
+	if vc == nil || !vc.Ready {
+		return
+	}
+
+	// 60ms tone with fast decay — a soft "tack", not annoying.
+	const clickDur = 60 * time.Millisecond
+	n := int(sampleRate * clickDur.Seconds())
+	clickPCM := make([]int16, n)
+	for i := 0; i < n; i++ {
+		t := float64(i) / sampleRate
+		env := math.Exp(-t * 80) // quick exponential decay
+		clickPCM[i] = int16(amp * math.Sin(2*math.Pi*freq*t) * env)
+	}
+
+	// Encode PCM -> Opus frames (20ms each).
+	enc, err := opus.NewEncoder(sampleRate, channels, opus.AppVoIP)
+	if err != nil {
+		log.Printf("voice: click encoder: %v", err)
+		return
+	}
+	var frames [][]byte
+	buf := make([]byte, 10000)
+	for i := 0; i+frameSamples <= n; i += frameSamples {
+		out, err := enc.Encode(clickPCM[i:i+frameSamples], buf)
+		if err != nil {
+			return
+		}
+		f := make([]byte, out)
+		copy(f, buf[:out])
+		frames = append(frames, f)
+	}
+	if len(frames) == 0 {
+		return
+	}
+
+	// Send the tone without claiming "speaking" for long.
+	if err := vc.Speaking(true); err != nil {
+		return
+	}
+	defer vc.Speaking(false)
+	for _, fr := range frames {
+		select {
+		case vc.OpusSend <- fr:
+		case <-time.After(time.Second):
+			return
+		}
+	}
 }
 
 // ttsProvider returns the configured TTS provider:

@@ -223,10 +223,11 @@ func brainAsk(text string) (string, error) {
 	return sendWithRetry(text)
 }
 
-// brainNotifyContact tells Baron who joined the voice channel, using the
-// shared contact card when the user is known. Baron's reply is spoken aloud
-// into the voice channel.
-func brainNotifyContact(displayName, userID string) {
+// brainNotifyState tells Baron about a voice-channel participant change
+// (join/leave) and who is currently in the channel. The notification is sent
+// as a technical message ONLY — Baron's reply is NOT spoken aloud, so he
+// learns the roster without voicing a greeting.
+func brainNotifyState(action, displayName, userID string, present []string) {
 	// Primary lookup: discord_id in the contact book (exact match).
 	// Fallback: name matching (case-insensitive).
 	var c *Contact
@@ -234,35 +235,46 @@ func brainNotifyContact(displayName, userID string) {
 		c = findContactByName(displayName)
 	}
 
-	msg := fmt.Sprintf("[ТЕХНИЧЕСКОЕ] В голосовой канал зашёл участник: %s (discord id %s). Неизвестный пользователь.",
-		displayName, userID)
+	who := "Неизвестный пользователь"
 	if c != nil {
-		msg = fmt.Sprintf("[ТЕХНИЧЕСКОЕ] В голосовой канал зашёл участник: %s (discord id %s). Это %s.",
-			displayName, userID, c.Name)
-		if c.Who != "" {
-			msg += " " + c.Who + "."
-		}
-		if c.Summary != "" {
-			msg += " Ранее обсуждали: " + c.Summary
-		}
+		who = c.Name
 	}
-	reply, err := sendWithRetry(msg)
-	if err != nil {
+
+	actionRu := "зашёл"
+	if action == "leave" {
+		actionRu = "вышел"
+	}
+	msg := fmt.Sprintf("[ТЕХНИЧЕСКОЕ] В голосовой канал %s участник: %s (discord id %s). Это %s.",
+		actionRu, displayName, userID, who)
+	if c != nil && c.Who != "" {
+		msg += " " + c.Who + "."
+	}
+
+	// Append current roster so Baron knows who is in the channel.
+	msg += " Сейчас в канале: " + formatPresent(present)
+
+	// Send the technical message. The reply is discarded — the participant
+	// must NOT hear a spoken greeting on join/leave.
+	if _, err := sendWithRetry(msg); err != nil {
 		log.Printf("brain: notify failed: %v", err)
 		return
 	}
-	log.Printf("brain: notified Baron about %s", displayName)
+	log.Printf("brain: notified Baron: %s %s (silent), present=%d", action, displayName, len(present))
+}
 
-	reply = trimWhitespace(reply)
-	log.Printf("brain: notify reply (%d chars): %q", len(reply), reply)
-	if reply == "" {
-		return
+// formatPresent renders the current channel roster as a human-readable list,
+// resolving user IDs to contact names where possible.
+func formatPresent(ids []string) string {
+	if len(ids) == 0 {
+		return "никого, кроме бота"
 	}
-	// Speak Baron's reply into the voice channel so the participant hears it.
-	theBot.mu.Lock()
-	vc := theBot.vc
-	theBot.mu.Unlock()
-	if vc != nil && vc.Ready {
-		theBot.speak(vc, reply)
+	names := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if c := findContactByDiscordID(id); c != nil {
+			names = append(names, c.Name)
+			continue
+		}
+		names = append(names, "пользователь "+id)
 	}
+	return strings.Join(names, ", ")
 }
