@@ -20,7 +20,7 @@ const (
 	sampleRate    = 48000
 	channels      = 1
 	frameSamples  = 960 // 20 ms at 48 kHz
-	silenceMS     = 800 // end utterance after this much silence
+	silenceMS     = 500 // end utterance after this much silence
 	maxUtteranceS = 28  // hard cap per utterance; Yandex rejects audio >= 30s,
 	// so cut 2s early (by wall-clock speech time) to stay safely under.
 	rmsThreshold  = 800 // voice activity threshold (int16); high enough to
