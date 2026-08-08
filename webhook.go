@@ -23,9 +23,11 @@ func webhookURL() string {
 var httpClient = &http.Client{Timeout: 15 * time.Second}
 
 // postWebhook posts a JSON payload to the Discord webhook and returns the HTTP
-// status code and body.
-func postWebhook(payload any) (int, []byte, error) {
-	url := webhookURL()
+// status code and body. If url is empty, the default DISCORD_WEBHOOK_URL is used.
+func postWebhook(payload any, url string) (int, []byte, error) {
+	if url == "" {
+		url = webhookURL()
+	}
 	if url == "" {
 		return 0, nil, fmt.Errorf("DISCORD_WEBHOOK_URL not set")
 	}
@@ -58,7 +60,7 @@ func handlerDiscordSend(ctx context.Context, req mcp.CallToolRequest) (*mcp.Call
 	if agentname, ok := args["agentname"].(string); ok && agentname != "" {
 		payload["username"] = agentname
 	}
-	code, body, err := postWebhook(payload)
+	code, body, err := postWebhook(payload, strOr(args["webhook_url"], ""))
 	if err != nil {
 		return nil, err
 	}
@@ -82,7 +84,7 @@ func handlerDiscordSendEmbed(ctx context.Context, req mcp.CallToolRequest) (*mcp
 		embed["fields"] = fields
 	}
 	payload := map[string]any{"embeds": []any{embed}}
-	code, body, err := postWebhook(payload)
+	code, body, err := postWebhook(payload, strOr(args["webhook_url"], ""))
 	if err != nil {
 		return nil, err
 	}
