@@ -38,6 +38,11 @@ func tools() []server.ServerTool {
 		{Tool: mcp.NewTool("discord_voice_leave",
 			mcp.WithDescription("Leave the current Discord voice channel."),
 		), Handler: handlerDiscordVoiceLeave},
+		{Tool: mcp.NewTool("discord_read",
+			mcp.WithDescription("Read recent messages from a Discord channel (by name or ID). Uses the bot token. Returns newest messages with author and time."),
+			mcp.WithString("channel", mcp.Description("Channel name (e.g. 'mail butler') or ID"), mcp.Required()),
+			mcp.WithNumber("limit", mcp.Description("Max messages (default 10, max 100)")),
+		), Handler: handlerDiscordRead},
 	}
 }
 
