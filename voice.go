@@ -589,16 +589,17 @@ func (b *bot) checkInterruptCommand(vc *discordgo.VoiceConnection, pcm []int16) 
 
 // matchCommand normalizes a transcribed phrase into a known voice command,
 // using root-substring matching to tolerate STT errors on noisy audio.
-// Returns "стоп" (stop only), "молчи" (stop + mute), "продолжаем", "повтори"
-// or "".
+// Commands:
+//   - "молчи" (mute): "молчи", "замолчи"
+//   - "стоп" (interrupt only): "остановись", "хватит"
+//   - "продолжаем" (un-mute)
+//   - "повтори" (replay last reply)
 func matchCommand(text string) string {
 	t := strings.ToLower(strings.TrimSpace(text))
 	switch {
-	case strings.HasPrefix(t, "ст") || strings.Contains(t, "стоп") ||
-		strings.Contains(t, "останов"):
+	case strings.Contains(t, "останов") || strings.Contains(t, "хват"):
 		return "стоп"
-	case strings.Contains(t, "молч") || strings.Contains(t, "тих") ||
-		strings.Contains(t, "хват") || strings.Contains(t, "заткн"):
+	case strings.Contains(t, "молч"):
 		return "молчи"
 	case strings.Contains(t, "продолж"):
 		return "продолжаем"
