@@ -32,6 +32,10 @@ const (
 	// minTailSpeechMS: utterances shorter than this that started while the
 	// bot was busy are treated as tails and dropped; longer ones are kept.
 	minTailSpeechMS = 2000
+	// interruptRmsThreshold is the VAD threshold used while the bot is
+	// speaking (barge-in listening). Lower than rmsThreshold because the
+	// user's voice arrives quieter over the bot's own TTS playback.
+	interruptRmsThreshold = 400
 )
 
 // speaking flag prevents the bot from recording its own TTS playback.
@@ -156,8 +160,12 @@ func (b *bot) recordingLoop(vc *discordgo.VoiceConnection, guildID, channelID st
 						continue
 					}
 					frame = frame[:n]
+					// While the bot speaks, the user's voice arrives quieter
+					// (mic pickup degrades over the loud TTS), so use a lower
+					// VAD threshold here. False alarms are fine — only exact
+					// commands interrupt playback.
 					rms := rmsInt16(frame)
-					if rms > rmsThreshold {
+					if rms > interruptRmsThreshold {
 						icPCM = append(icPCM, frame...)
 						icLastSpeech = time.Now()
 						if !icActive {
