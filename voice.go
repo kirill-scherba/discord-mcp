@@ -56,6 +56,41 @@ func (b *bot) setBusy(v bool) {
 	b.mu.Unlock()
 }
 
+// isMuted reports whether the bot is in "молчи" mode.
+func (b *bot) isMuted() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.muted
+}
+
+// setMuted toggles "молчи" mode.
+func (b *bot) setMuted(v bool) {
+	b.mu.Lock()
+	b.muted = v
+	b.mu.Unlock()
+}
+
+// setInterrupt flags that the user started speaking during playback.
+func (b *bot) setInterrupt() {
+	b.mu.Lock()
+	b.interrupt = true
+	b.mu.Unlock()
+}
+
+// clearInterrupt resets the barge-in flag.
+func (b *bot) clearInterrupt() {
+	b.mu.Lock()
+	b.interrupt = false
+	b.mu.Unlock()
+}
+
+// interrupted reports whether barge-in was triggered.
+func (b *bot) interrupted() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.interrupt
+}
+
 // wasBusyAt reports whether the bot was busy (speaking or processing a
 // previous utterance) at the given time. Used to reject utterance tails that
 // were recorded while the bot was replying.
@@ -95,16 +130,44 @@ func (b *bot) recordingLoop(vc *discordgo.VoiceConnection, guildID, channelID st
 	log.Printf("voice: recording loop started in %s", channelID)
 
 	for {
-		// While an utterance is being processed (STT/brain/TTS), discard all
-		// incoming audio: it is either the tail of the phrase in flight or
-		// speech that cannot interrupt the bot anyway.
+		// While an utterance is being processed (STT/brain), discard incoming
+		// audio — it cannot be answered yet. But during playback (bot
+		// speaking) we LISTEN for barge-in: if the user starts talking, we
+		// set interrupt so speak() stops, then the phrase is processed.
 		if b.isBusy() {
-			for len(vc.OpusRecv) > 0 {
-				<-vc.OpusRecv
+			if b.isSpeakingNow() {
+				// Bot is playing TTS: listen for user speech to barge-in.
+				select {
+				case p, ok := <-vc.OpusRecv:
+					if !ok {
+						return
+					}
+					frame := make([]int16, frameSamples)
+					n, derr := dec.Decode(p.Opus, frame)
+					if derr == nil && n > 0 {
+						if rmsInt16(frame[:n]) > rmsThreshold {
+							b.setInterrupt()
+						}
+					}
+				case <-time.After(2 * time.Second):
+					// no audio while speaking — fine, keep waiting
+				}
+			} else {
+				// Processing (STT/brain): discard everything.
+				for len(vc.OpusRecv) > 0 {
+					<-vc.OpusRecv
+				}
+				time.Sleep(50 * time.Millisecond)
 			}
-			time.Sleep(50 * time.Millisecond)
 			continue
 		}
+
+		// In "молчи" mode ignore all audio (no STT, no brain). Only the
+		// "продолжаем" command (handled via STT in processUtterance) can
+		// re-enable listening — so we still transcribe, but drop everything
+		// that is not the un-mute command. For simplicity, keep transcribing
+		// and let processUtterance filter: it checks isMuted and only the
+		// un-mute command passes.
 
 		select {
 		case p, ok := <-vc.OpusRecv:
@@ -418,6 +481,17 @@ func (b *bot) processUtterance(vc *discordgo.VoiceConnection, pcm []int16, speec
 	log.Printf("voice: heard: %q", text)
 	log.Printf("voice: heard pcm=%dms", len(pcm)/sampleRate*1000)
 
+	// Commands handled locally (not sent to brain).
+	if handled := b.handleVoiceCommand(vc, text); handled {
+		return
+	}
+
+	// Prepend a technical timestamp so Baron knows the current date/time
+	// and how much time has passed between messages. Marked as technical
+	// info so he doesn't mistake it for user speech.
+	text = fmt.Sprintf("[ТЕХНИЧЕСКАЯ ИНФОРМАЦИЯ: %s UTC] %s",
+		time.Now().UTC().Format("2006-01-02 15:04"), text)
+
 	reply, err := brainAsk(text)
 	if err != nil {
 		log.Printf("voice: brain failed: %v", err)
@@ -434,8 +508,54 @@ func (b *bot) processUtterance(vc *discordgo.VoiceConnection, pcm []int16, speec
 	// Splits the wait into two known phases so the user knows it's working.
 	b.playClick(vc, 1800, 6000)
 
+	// Remember the reply so "повтори" can replay it.
+	b.mu.Lock()
+	b.lastReply = reply
+	b.mu.Unlock()
+
 	b.speak(vc, reply)
 	step("tts-play")
+}
+
+// handleVoiceCommand processes local voice commands (single words, exact
+// match after lowercasing). Returns true if the text was a command and was
+// handled locally (not sent to brain). While muted, ALL speech is ignored
+// except the "продолжаем" un-mute command.
+func (b *bot) handleVoiceCommand(vc *discordgo.VoiceConnection, text string) bool {
+	cmd := strings.ToLower(strings.TrimSpace(text))
+
+	// Un-mute command always works, even while muted.
+	if cmd == "продолжаем" || cmd == "продолжай" {
+		b.setMuted(false)
+		log.Printf("voice: command: muted OFF")
+		b.speak(vc, "Продолжаем.")
+		return true
+	}
+
+	// While muted, drop everything else (including "молчи" again).
+	if b.isMuted() {
+		log.Printf("voice: muted, ignoring: %q", text)
+		return true
+	}
+
+	switch cmd {
+	case "молчи", "замолчи":
+		b.setMuted(true)
+		log.Printf("voice: command: muted ON")
+		b.speak(vc, "Молчу.")
+		return true
+	case "повтори", "повтори ещё раз", "повтори пожалуйста":
+		b.mu.Lock()
+		last := b.lastReply
+		b.mu.Unlock()
+		if last == "" {
+			b.speak(vc, "Мне пока нечего повторить.")
+		} else {
+			b.speak(vc, last)
+		}
+		return true
+	}
+	return false
 }
 
 // playClick plays a short feedback tone ("tack") into the voice channel.
@@ -573,6 +693,8 @@ func (b *bot) speak(vc *discordgo.VoiceConnection, text string) {
 
 	b.setTTSSpeaking(true)
 	defer b.setTTSSpeaking(false)
+	b.clearInterrupt()
+	defer b.clearInterrupt()
 
 	if err := vc.Speaking(true); err != nil {
 		log.Printf("voice: speaking(true): %v", err)
@@ -581,6 +703,11 @@ func (b *bot) speak(vc *discordgo.VoiceConnection, text string) {
 	defer vc.Speaking(false)
 
 	for _, frame := range audio {
+		// Barge-in: if the user started speaking, stop playback at once.
+		if b.interrupted() {
+			log.Printf("voice: interrupted by user, stopping playback")
+			return
+		}
 		select {
 		case vc.OpusSend <- frame:
 		case <-time.After(2 * time.Second):

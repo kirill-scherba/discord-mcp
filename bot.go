@@ -45,6 +45,14 @@ type bot struct {
 	// the tail of the phrase being processed or speech that cannot interrupt
 	// the bot anyway). Cleared after playback finishes.
 	busy bool
+	// muted: voice commands "молчи"/"продолжаем". While muted, all incoming
+	// audio is ignored (no STT, no brain).
+	muted bool
+	// interrupt: set when the user starts speaking during playback; the
+	// speak loop checks it and stops playback immediately (barge-in).
+	interrupt bool
+	// lastReply: the last spoken reply, so "повтори" can replay it.
+	lastReply string
 
 	// processMu serializes the STT -> brain -> TTS pipeline so replies
 	// never overlap. speakMu guards the OpusSend writer against concurrent
