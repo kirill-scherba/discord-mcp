@@ -585,11 +585,28 @@ func (b *bot) checkInterruptCommand(vc *discordgo.VoiceConnection, pcm []int16) 
 func (b *bot) handleVoiceCommand(vc *discordgo.VoiceConnection, text string) bool {
 	cmd := strings.ToLower(strings.TrimSpace(text))
 
-	// Un-mute command always works, even while muted.
+	// Commands that work even while muted:
+
+	// "Продолжаем" un-mutes.
 	if cmd == "продолжаем" || cmd == "продолжай" {
 		b.setMuted(false)
 		log.Printf("voice: command: muted OFF")
 		b.speak(vc, "Продолжаем.")
+		return true
+	}
+
+	// "Повтори" also un-mutes (so it works after "молчи") and replays.
+	if cmd == "повтори" || cmd == "повтори ещё раз" || cmd == "повтори пожалуйста" {
+		b.setMuted(false)
+		log.Printf("voice: command: muted OFF (повтори)")
+		b.mu.Lock()
+		last := b.lastReply
+		b.mu.Unlock()
+		if last == "" {
+			b.speak(vc, "Мне пока нечего повторить.")
+		} else {
+			b.speak(vc, last)
+		}
 		return true
 	}
 
@@ -604,16 +621,6 @@ func (b *bot) handleVoiceCommand(vc *discordgo.VoiceConnection, text string) boo
 		b.setMuted(true)
 		log.Printf("voice: command: muted ON")
 		b.speak(vc, "Молчу.")
-		return true
-	case "повтори", "повтори ещё раз", "повтори пожалуйста":
-		b.mu.Lock()
-		last := b.lastReply
-		b.mu.Unlock()
-		if last == "" {
-			b.speak(vc, "Мне пока нечего повторить.")
-		} else {
-			b.speak(vc, last)
-		}
 		return true
 	}
 	return false
