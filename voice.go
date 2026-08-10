@@ -560,35 +560,55 @@ func (b *bot) checkInterruptCommand(vc *discordgo.VoiceConnection, pcm []int16) 
 	}
 	log.Printf("voice: interrupt heard: %q", text)
 
-	cmd := strings.ToLower(text)
-	switch cmd {
-	case "стоп", "остановись", "замолчи", "молчи":
-		log.Printf("voice: barge-in command: %q", cmd)
-		// Stop playback immediately.
+	// Fuzzy command matching: STT on a noisy background gives variations
+	// ("молчу" vs "молчи", "оуп" vs "стоп"), so match by root substring
+	// rather than exact equality.
+	switch matchCommand(text) {
+	case "стоп":
+		log.Printf("voice: barge-in command: стоп")
 		b.setInterrupt()
-		// For "молчи" also enter mute mode and confirm aloud.
-		if cmd == "молчи" || cmd == "замолчи" {
-			b.setMuted(true)
-			log.Printf("voice: command: muted ON (barge-in)")
-			go b.speak(vc, "Молчу.")
-		}
+	case "молчи":
+		log.Printf("voice: barge-in command: молчи")
+		b.setInterrupt()
+		b.setMuted(true)
+		log.Printf("voice: command: muted ON (barge-in)")
+		go b.speak(vc, "Молчу.")
 	default:
 		// Not a command — ignore, bot keeps speaking.
-		log.Printf("voice: barge-in non-command ignored: %q", cmd)
+		log.Printf("voice: barge-in non-command ignored: %q", text)
 	}
 }
 
-// handleVoiceCommand processes local voice commands (single words, exact
-// match after lowercasing). Returns true if the text was a command and was
-// handled locally (not sent to brain). While muted, ALL speech is ignored
-// except the "продолжаем" un-mute command.
+// matchCommand normalizes a transcribed phrase into a known voice command,
+// using root-substring matching to tolerate STT errors on noisy audio.
+// Returns "стоп", "молчи", "продолжаем", "повтори" or "".
+func matchCommand(text string) string {
+	t := strings.ToLower(strings.TrimSpace(text))
+	switch {
+	case strings.HasPrefix(t, "ст") || strings.Contains(t, "стоп") ||
+		strings.Contains(t, "останов"):
+		return "стоп"
+	case strings.Contains(t, "молч"):
+		return "молчи"
+	case strings.Contains(t, "продолж"):
+		return "продолжаем"
+	case strings.Contains(t, "повтор"):
+		return "повтори"
+	}
+	return ""
+}
+
+// handleVoiceCommand processes local voice commands. Returns true if the
+// text was a command and was handled locally (not sent to brain). While
+// muted, ALL speech is ignored except "продолжаем" (un-mute) and "повтори"
+// (un-mute + replay).
 func (b *bot) handleVoiceCommand(vc *discordgo.VoiceConnection, text string) bool {
-	cmd := strings.ToLower(strings.TrimSpace(text))
+	cmd := matchCommand(text)
 
 	// Commands that work even while muted:
 
 	// "Продолжаем" un-mutes.
-	if cmd == "продолжаем" || cmd == "продолжай" {
+	if cmd == "продолжаем" {
 		b.setMuted(false)
 		log.Printf("voice: command: muted OFF")
 		b.speak(vc, "Продолжаем.")
@@ -596,7 +616,7 @@ func (b *bot) handleVoiceCommand(vc *discordgo.VoiceConnection, text string) boo
 	}
 
 	// "Повтори" also un-mutes (so it works after "молчи") and replays.
-	if cmd == "повтори" || cmd == "повтори ещё раз" || cmd == "повтори пожалуйста" {
+	if cmd == "повтори" {
 		b.setMuted(false)
 		log.Printf("voice: command: muted OFF (повтори)")
 		b.mu.Lock()
@@ -616,8 +636,8 @@ func (b *bot) handleVoiceCommand(vc *discordgo.VoiceConnection, text string) boo
 		return true
 	}
 
-	switch cmd {
-	case "молчи", "замолчи":
+	// "Молчи" mutes (only when not already muted).
+	if cmd == "молчи" {
 		b.setMuted(true)
 		log.Printf("voice: command: muted ON")
 		b.speak(vc, "Молчу.")
