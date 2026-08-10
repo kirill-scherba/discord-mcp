@@ -127,16 +127,24 @@ func (b *bot) recordingLoop(vc *discordgo.VoiceConnection, guildID, channelID st
 	var speechStart time.Time
 	active := false
 
+	// Interrupt listening state (used while the bot is speaking): we listen
+	// for short voice commands ("стоп", "молчи") but do NOT barge-in on
+	// arbitrary background noise (street, store) — only on commands.
+	var icPCM []int16
+	var icLastSpeech time.Time
+	var icActive bool
+
 	log.Printf("voice: recording loop started in %s", channelID)
 
 	for {
 		// While an utterance is being processed (STT/brain), discard incoming
-		// audio — it cannot be answered yet. But during playback (bot
-		// speaking) we LISTEN for barge-in: if the user starts talking, we
-		// set interrupt so speak() stops, then the phrase is processed.
+		// audio — it cannot be answered yet. During playback (bot speaking)
+		// we LISTEN but only react to explicit commands ("стоп", "молчи").
+		// Background noise is ignored — no false barge-in on the street.
 		if b.isBusy() {
 			if b.isSpeakingNow() {
-				// Bot is playing TTS: listen for user speech to barge-in.
+				// Bot is playing TTS: accumulate speech; if it looks like a
+				// short command phrase, transcribe and check for commands.
 				select {
 				case p, ok := <-vc.OpusRecv:
 					if !ok {
@@ -144,10 +152,25 @@ func (b *bot) recordingLoop(vc *discordgo.VoiceConnection, guildID, channelID st
 					}
 					frame := make([]int16, frameSamples)
 					n, derr := dec.Decode(p.Opus, frame)
-					if derr == nil && n > 0 {
-						if rmsInt16(frame[:n]) > rmsThreshold {
-							b.setInterrupt()
+					if derr != nil || n == 0 {
+						continue
+					}
+					frame = frame[:n]
+					rms := rmsInt16(frame)
+					if rms > rmsThreshold {
+						icPCM = append(icPCM, frame...)
+						icLastSpeech = time.Now()
+						if !icActive {
+							icActive = true
 						}
+					} else if icActive {
+						icPCM = append(icPCM, frame...)
+					}
+					// Command phrases are short; when the user pauses, check.
+					if icActive && time.Since(icLastSpeech) > silenceMS*time.Millisecond {
+						b.checkInterruptCommand(vc, icPCM)
+						icPCM = nil
+						icActive = false
 					}
 				case <-time.After(2 * time.Second):
 					// no audio while speaking — fine, keep waiting
@@ -515,6 +538,44 @@ func (b *bot) processUtterance(vc *discordgo.VoiceConnection, pcm []int16, speec
 
 	b.speak(vc, reply)
 	step("tts-play")
+}
+
+// checkInterruptCommand is called while the bot is speaking. It transcribes
+// the short accumulated phrase and, if it is an interrupt command ("стоп",
+// "молчи"), stops playback and executes it. Non-commands are ignored — the
+// bot keeps talking (no false barge-in on background noise).
+func (b *bot) checkInterruptCommand(vc *discordgo.VoiceConnection, pcm []int16) {
+	if len(pcm) < sampleRate/4 { // ignore sub-250ms blips
+		return
+	}
+	wav := pcmToWAV(pcm)
+	text, err := transcribe(wav)
+	if err != nil {
+		log.Printf("voice: interrupt STT failed: %v", err)
+		return
+	}
+	text = trimWhitespace(text)
+	if text == "" {
+		return
+	}
+	log.Printf("voice: interrupt heard: %q", text)
+
+	cmd := strings.ToLower(text)
+	switch cmd {
+	case "стоп", "остановись", "замолчи", "молчи":
+		log.Printf("voice: barge-in command: %q", cmd)
+		// Stop playback immediately.
+		b.setInterrupt()
+		// For "молчи" also enter mute mode and confirm aloud.
+		if cmd == "молчи" || cmd == "замолчи" {
+			b.setMuted(true)
+			log.Printf("voice: command: muted ON (barge-in)")
+			go b.speak(vc, "Молчу.")
+		}
+	default:
+		// Not a command — ignore, bot keeps speaking.
+		log.Printf("voice: barge-in non-command ignored: %q", cmd)
+	}
 }
 
 // handleVoiceCommand processes local voice commands (single words, exact
