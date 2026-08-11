@@ -2,14 +2,10 @@
 package main
 
 import (
-	"bytes"
-	"encoding/binary"
 	"fmt"
 	"log"
 	"math"
-	"os"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/cartridge-gg/discordgo"
@@ -721,24 +717,6 @@ func (b *bot) playClick(vc *discordgo.VoiceConnection, freq, amp float64) {
 	}
 }
 
-// ttsProvider returns the configured TTS provider:
-//   - "edge"   — Microsoft edge-tts only
-//   - "openai" — OpenAI Audio Speech API only
-//   - "yandex" — Yandex SpeechKit only
-//   - "auto"   — edge-tts with OpenAI fallback (default)
-//
-// Controlled by the TTS_PROVIDER env var so switching during tests is a
-// one-line change in the service unit + restart, no rebuild needed.
-func ttsProvider() string {
-	p := strings.ToLower(strings.TrimSpace(os.Getenv("TTS_PROVIDER")))
-	switch p {
-	case "edge", "openai", "yandex", "auto":
-		return p
-	default:
-		return "auto"
-	}
-}
-
 // speak synthesizes text via TTS and plays it into the voice channel.
 // Provider is selected by TTS_PROVIDER: edge-tts, OpenAI, Yandex, or auto
 // (edge-tts primary, OpenAI fallback on Microsoft throttling).
@@ -825,93 +803,3 @@ func (b *bot) speak(vc *discordgo.VoiceConnection, text string) {
 		}
 	}
 }
-
-// pcmToWAV builds a 16-bit mono WAV file from PCM samples.
-func pcmToWAV(pcm []int16) []byte {
-	var buf bytes.Buffer
-	dataLen := len(pcm) * 2
-	// RIFF header
-	buf.WriteString("RIFF")
-	binary.Write(&buf, binary.LittleEndian, uint32(36+dataLen))
-	buf.WriteString("WAVE")
-	buf.WriteString("fmt ")
-	binary.Write(&buf, binary.LittleEndian, uint32(16))
-	binary.Write(&buf, binary.LittleEndian, uint16(1)) // PCM
-	binary.Write(&buf, binary.LittleEndian, uint16(channels))
-	binary.Write(&buf, binary.LittleEndian, uint32(sampleRate))
-	binary.Write(&buf, binary.LittleEndian, uint32(sampleRate*2))
-	binary.Write(&buf, binary.LittleEndian, uint16(2)) // block align
-	binary.Write(&buf, binary.LittleEndian, uint16(16)) // bits per sample
-	buf.WriteString("data")
-	binary.Write(&buf, binary.LittleEndian, uint32(dataLen))
-	for _, s := range pcm {
-		binary.Write(&buf, binary.LittleEndian, s)
-	}
-	return buf.Bytes()
-}
-
-// rmsInt16 computes the RMS of a PCM frame.
-func rmsInt16(frame []int16) float64 {
-	if len(frame) == 0 {
-		return 0
-	}
-	var sum float64
-	for _, s := range frame {
-		sum += float64(s) * float64(s)
-	}
-	return math.Sqrt(sum / float64(len(frame)))
-}
-
-// avgRMS computes the average RMS over a whole buffer (used as an energy gate
-// before sending to STT).
-func avgRMS(pcm []int16) float64 {
-	if len(pcm) == 0 {
-		return 0
-	}
-	var sum float64
-	for _, s := range pcm {
-		sum += float64(s) * float64(s)
-	}
-	return math.Sqrt(sum / float64(len(pcm)))
-}
-
-func trimWhitespace(s string) string {
-	start := 0
-	end := len(s)
-	for start < end && (s[start] == ' ' || s[start] == '\n' || s[start] == '\t' || s[start] == '\r') {
-		start++
-	}
-	for end > start && (s[end-1] == ' ' || s[end-1] == '\n' || s[end-1] == '\t' || s[end-1] == '\r') {
-		end--
-	}
-	return s[start:end]
-}
-
-// isGarbageSTT filters known Whisper hallucinations on silence/noise.
-// Whisper sometimes invents subtitles, credits, or random phrases when
-// the input is quiet — these get sent to Baron and pollute the session.
-var garbageSTTPhrases = []string{
-	"Редактор субтитров",
-	"Корректор",
-	"Субтитры",
-	"Спасибо за просмотр",
-	"Подписывайтесь на канал",
-	"Thanks for watching",
-	"Subtitles by",
-}
-
-func isGarbageSTT(text string) bool {
-	for _, phrase := range garbageSTTPhrases {
-		if strings.Contains(text, phrase) {
-			return true
-		}
-	}
-	return false
-}
-
-// ensureVar keeps the os import used even if debug logging is disabled.
-var _ = os.Getenv
-
-var _ sync.Mutex // keep sync imported for future use
-
-var _ = fmt.Sprintf

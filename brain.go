@@ -1,11 +1,8 @@
-// brain.go — connection to Baron via opencode-serve.
+// brain.go — connection to Baron via opencode-serve (Discord-specific part).
 //
-// A single long-lived session is kept so the bot has context across the whole
-// voice conversation. The session is created EMPTY — no prior history is
-// injected, the conversation context lives inside the session itself.
-// Right after creation Baron gets a startup message telling him he is in a
-// voice chat; when a participant joins, Baron is notified with the matching
-// contact card from /srv/contacts/ (same contact book as mail-mcp).
+// Shared pipeline (sessions, brainAsk) lives in voicekit; this file keeps the
+// contact book lookup and participant join/leave notifications used only by
+// the Discord bot.
 package main
 
 import (
@@ -16,24 +13,17 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 
-	opencodeclient "github.com/kirill-scherba/opencode-client"
+	"github.com/kirill-scherba/discord-mcp/voicekit"
 )
 
 // contactsDir is the shared contact book directory (same as mail-mcp).
 const contactsDir = "/srv/contacts"
 
-// opencodeBaseURL is the opencode-serve instance for voice sessions.
-// Uses the same server as mail-mcp (port 7712), separate from the main
-// opencode-serve (7709) that powers the IDE.
-const opencodeBaseURL = "http://127.0.0.1:7712"
-
-var (
-	brainMu   sync.Mutex
-	brainCl   *opencodeclient.Client
-	brainSess *opencodeclient.Session
-)
+// brainAsk sends the user text to Baron and returns his reply.
+func brainAsk(text string) (string, error) {
+	return voicekit.BrainAsk(text)
+}
 
 // Contact is a contact card from the shared contact book.
 type Contact struct {
@@ -50,15 +40,11 @@ type Contact struct {
 // contactKey mirrors mail-mcp: md5 hash of the lowercased email.
 func contactKey(email string) string {
 	hash := fmt.Sprintf("%x", md5.Sum([]byte(strings.ToLower(strings.TrimSpace(email)))))
-	return contactsDir + "/" + hash + ".json"
+	return filepath.Join(contactsDir, hash+".json")
 }
 
-// findContactByName returns the first contact whose Name matches the given
-// Discord display name (case-insensitive exact or substring match).
+// findContactByName returns the first contact whose Name matches.
 func findContactByName(name string) *Contact {
-	if name == "" {
-		return nil
-	}
 	entries, err := os.ReadDir(contactsDir)
 	if err != nil {
 		return nil
@@ -73,23 +59,17 @@ func findContactByName(name string) *Contact {
 			continue
 		}
 		var c Contact
-		if err := json.Unmarshal(data, &c); err != nil {
+		if json.Unmarshal(data, &c) != nil {
 			continue
 		}
-		if c.Name == "" {
-			continue
-		}
-		cl := strings.ToLower(c.Name)
-		if cl == lower || strings.Contains(lower, cl) || strings.Contains(cl, lower) {
+		if strings.ToLower(c.Name) == lower {
 			return &c
 		}
 	}
 	return nil
 }
 
-// findContactByDiscordID returns the contact whose discord_id matches the
-// given Discord user ID. This is the primary lookup — more reliable than
-// name matching since Discord display names can change.
+// findContactByDiscordID returns the contact whose discord_id matches.
 func findContactByDiscordID(userID string) *Contact {
 	if userID == "" {
 		return nil
@@ -107,7 +87,7 @@ func findContactByDiscordID(userID string) *Contact {
 			continue
 		}
 		var c Contact
-		if err := json.Unmarshal(data, &c); err != nil {
+		if json.Unmarshal(data, &c) != nil {
 			continue
 		}
 		if c.DiscordID == userID {
@@ -117,119 +97,9 @@ func findContactByDiscordID(userID string) *Contact {
 	return nil
 }
 
-// isSessionGone reports whether the error means the opencode-serve session
-// disappeared (server restart, TTL expiry, manual close). In that case a
-// fresh session must be created. The old session is never closed by us.
-func isSessionGone(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := err.Error()
-	return strings.Contains(msg, "Session not found") || strings.Contains(msg, "404")
-}
-
-// createBrainSession creates a fresh empty session and sends the startup
-// message telling Baron he is in a voice chat.
-func createBrainSession(cl *opencodeclient.Client) (*opencodeclient.Session, error) {
-	sess, err := cl.CreateSession("voice-chat", "baron", "", "", "discord", nil)
-	if err != nil {
-		return nil, fmt.Errorf("brain: create session: %w", err)
-	}
-	log.Printf("brain: session created %s", sess.ID)
-
-	startup := "Ты находишься в голосовом чате Discord. Это НЕ текстовый чат с " +
-		"Кириллом — ты агент, подключённый к войс-каналу через программу-посредника.\n\n" +
-		"Используй SKILL voice-chat для правил работы в голосовом чате."
-	if _, err := cl.SendMessage(sess, startup); err != nil {
-		return nil, fmt.Errorf("brain: startup message: %w", err)
-	}
-	log.Printf("brain: startup message sent")
-	return sess, nil
-}
-
-// getBrainSession returns the shared session, creating it lazily on first use.
-// The session ID is persisted across bot restarts (see session_store.go): the
-// voice-chat session is meant to live forever, so a restart reuses it.
-func getBrainSession() (*opencodeclient.Session, error) {
-	brainMu.Lock()
-	defer brainMu.Unlock()
-	if brainCl == nil {
-		brainCl = opencodeclient.New(opencodeBaseURL, 0)
-	}
-	if brainSess == nil {
-		if ps := persistedSession(); ps != nil {
-			// Reuse the saved session; sendWithRetry recreates it if dead.
-			brainSess = ps
-			log.Printf("brain: reusing persisted session %s", ps.ID)
-			return brainSess, nil
-		}
-		sess, err := newVoiceSession(brainCl)
-		if err != nil {
-			return nil, err
-		}
-		brainSess = sess
-	}
-	return brainSess, nil
-}
-
-// resetBrainSession drops the current session so the next call recreates it.
-// The old session is left untouched on the server.
-func resetBrainSession() {
-	brainMu.Lock()
-	brainSess = nil
-	brainMu.Unlock()
-}
-
-// sendWithRetry sends a message to Baron, recreating the session once if it
-// was lost (Session not found / 404). The message itself is preserved.
-// The entire recreate path is serialised under brainMu to prevent multiple
-// goroutines from racing to create sessions when the persisted one dies.
-func sendWithRetry(text string) (string, error) {
-	sess, err := getBrainSession()
-	if err != nil {
-		return "", err
-	}
-	reply, err := brainCl.SendMessage(sess, text)
-	if err != nil && isSessionGone(err) {
-		log.Printf("brain: session lost, recreating: %v", err)
-		// Atomically drop + recreate under the lock so only ONE goroutine
-		// creates the replacement session.
-		brainMu.Lock()
-		// Double-check: another goroutine may have already recreated while
-		// we were waiting for the lock.
-		if brainSess != nil && brainSess.ID == sess.ID {
-			brainSess = nil
-		}
-		if brainSess == nil {
-			newSess, createErr := newVoiceSession(brainCl)
-			if createErr != nil {
-				brainMu.Unlock()
-				return "", createErr
-			}
-			brainSess = newSess
-		}
-		sess = brainSess
-		brainMu.Unlock()
-		reply, err = brainCl.SendMessage(sess, text)
-	}
-	if err != nil {
-		return "", fmt.Errorf("send message: %w", err)
-	}
-	return reply, nil
-}
-
-// brainAsk sends a user utterance to Baron and returns the reply text.
-func brainAsk(text string) (string, error) {
-	return sendWithRetry(text)
-}
-
 // brainNotifyState tells Baron about a voice-channel participant change
-// (join/leave) and who is currently in the channel. The notification is sent
-// as a technical message ONLY — Baron's reply is NOT spoken aloud, so he
-// learns the roster without voicing a greeting.
+// (join/leave) and who is currently in the channel. Silent — not spoken.
 func brainNotifyState(action, displayName, userID string, present []string) {
-	// Primary lookup: discord_id in the contact book (exact match).
-	// Fallback: name matching (case-insensitive).
 	var c *Contact
 	if c = findContactByDiscordID(userID); c == nil {
 		c = findContactByName(displayName)
@@ -249,21 +119,16 @@ func brainNotifyState(action, displayName, userID string, present []string) {
 	if c != nil && c.Who != "" {
 		msg += " " + c.Who + "."
 	}
-
-	// Append current roster so Baron knows who is in the channel.
 	msg += " Сейчас в канале: " + formatPresent(present)
 
-	// Send the technical message. The reply is discarded — the participant
-	// must NOT hear a spoken greeting on join/leave.
-	if _, err := sendWithRetry(msg); err != nil {
+	if _, err := voicekit.BrainAsk(msg); err != nil {
 		log.Printf("brain: notify failed: %v", err)
 		return
 	}
 	log.Printf("brain: notified Baron: %s %s (silent), present=%d", action, displayName, len(present))
 }
 
-// formatPresent renders the current channel roster as a human-readable list,
-// resolving user IDs to contact names where possible.
+// formatPresent renders the current channel roster as a human-readable list.
 func formatPresent(ids []string) string {
 	if len(ids) == 0 {
 		return "никого, кроме бота"
