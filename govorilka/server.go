@@ -166,8 +166,10 @@ func govorilkaSignal(w http.ResponseWriter, r *http.Request) {
 				log.Printf("govorilka: track read: %v", err)
 				return
 			}
-			// Decode Opus RTP payload -> PCM (20ms frame).
-			decoded, derr := dec.Decode(rtpBuf[n-960:], pcmBuf)
+			// RTP header is 12 bytes; the rest is the Opus payload.
+			payload := rtpBuf[12:n]
+			// Decode Opus payload -> PCM (20ms frame).
+			decoded, derr := dec.Decode(payload, pcmBuf)
 			if derr != nil || decoded == 0 {
 				continue
 			}
