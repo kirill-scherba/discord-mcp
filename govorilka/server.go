@@ -11,6 +11,7 @@ package main
 import (
 	"encoding/json"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"sync"
@@ -46,6 +47,11 @@ type govorilkaPeer struct {
 	// (seq wraps to 0) and silently drop them — only the first reply plays.
 	seq uint16
 	ts  uint32
+
+	// Voice commands state (mirrors the Discord bot):
+	muted     bool
+	lastReply string
+	interrupt bool
 }
 
 // handleUtterance runs the voice pipeline for one utterance and sends the
@@ -53,7 +59,13 @@ type govorilkaPeer struct {
 // while a long reply is being sent, a new utterance waits (otherwise two
 // goroutines would write RTP concurrently and corrupt playback).
 func (p *govorilkaPeer) handleUtterance(pcm []int16) {
-	p.sendMu.Lock()
+	// Tail rejection: if a previous utterance is still being processed
+	// (STT/brain/TTS in flight), a new short phrase is its tail — drop it
+	// instead of queueing a confusing second reply.
+	if !p.sendMu.TryLock() {
+		log.Printf("govorilka: tail dropped (previous still processing)")
+		return
+	}
 	defer p.sendMu.Unlock()
 
 	log.Printf("govorilka: handleUtterance, %d samples (%.1f ms)", len(pcm), float64(len(pcm))/48.0)
@@ -75,6 +87,61 @@ func (p *govorilkaPeer) handleUtterance(pcm []int16) {
 	}
 	log.Printf("govorilka: heard: %q", text)
 
+	// Voice commands handled locally (mirror the Discord bot):
+	cmd := voicekit.MatchCommand(text)
+	// "стоп" interrupts playback without muting.
+	if cmd == "стоп" {
+		log.Printf("govorilka: interrupt command: стоп")
+		p.mu.Lock()
+		p.interrupt = true
+		p.mu.Unlock()
+		return
+	}
+	// "продолжаем" and "повтори" work even while muted.
+	if cmd == "продолжаем" {
+		p.mu.Lock()
+		p.muted = false
+		p.interrupt = true
+		p.mu.Unlock()
+		log.Printf("govorilka: muted OFF")
+		p.speakReply("Продолжаем.")
+		return
+	}
+	if cmd == "повтори" {
+		p.mu.Lock()
+		last := p.lastReply
+		p.muted = false
+		p.interrupt = true
+		p.mu.Unlock()
+		log.Printf("govorilka: muted OFF (повтори)")
+		if last == "" {
+			p.speakReply("Мне пока нечего повторить.")
+		} else {
+			p.speakReply(last)
+		}
+		return
+	}
+	// While muted, ignore everything else.
+	p.mu.Lock()
+	muted := p.muted
+	p.mu.Unlock()
+	if muted {
+		log.Printf("govorilka: muted, ignoring: %q", text)
+		return
+	}
+	if cmd == "молчи" {
+		p.mu.Lock()
+		p.muted = true
+		p.interrupt = true
+		p.mu.Unlock()
+		log.Printf("govorilka: muted ON")
+		p.speakReply("Молчу.")
+		return
+	}
+
+	// ПИК-1 (низкий): фраза принята и отправлена на обработку.
+	p.playClick(1200, 6000)
+
 	reply, err := voicekit.BrainAsk(text)
 	if err != nil {
 		log.Printf("govorilka: brain: %v", err)
@@ -85,6 +152,9 @@ func (p *govorilkaPeer) handleUtterance(pcm []int16) {
 		return
 	}
 	log.Printf("govorilka: reply: %q", reply)
+	p.mu.Lock()
+	p.lastReply = reply
+	p.mu.Unlock()
 
 	// Synthesize reply audio and send it back over the WebRTC track.
 	provider := voicekit.TTSProvider()
@@ -102,6 +172,9 @@ func (p *govorilkaPeer) handleUtterance(pcm []int16) {
 		return
 	}
 	log.Printf("govorilka: sending %d opus frames", len(frames))
+
+	// ПИК-2 (высокий): ответ готов, сейчас озвучится.
+	p.playClick(1800, 6000)
 
 	p.mu.Lock()
 	out := p.outTrack
@@ -128,6 +201,14 @@ func (p *govorilkaPeer) handleUtterance(pcm []int16) {
 			},
 			Payload: f,
 		}
+		// Barge-in: "стоп"/"молчи" while replying stops playback at once.
+		p.mu.Lock()
+		interrupted := p.interrupt
+		p.mu.Unlock()
+		if interrupted {
+			log.Printf("govorilka: interrupted, stopping playback")
+			break
+		}
 		if err := out.WriteRTP(pkt); err != nil {
 			log.Printf("govorilka: out write: %v", err)
 			return
@@ -135,6 +216,121 @@ func (p *govorilkaPeer) handleUtterance(pcm []int16) {
 		seq++
 		ts += 960 // 20ms at 48kHz
 		time.Sleep(frameDur)
+	}
+	p.mu.Lock()
+	p.seq = seq
+	p.ts = ts
+	p.interrupt = false
+	p.mu.Unlock()
+}
+
+// speakReply synthesizes a short phrase (command confirmation) and sends it
+// to the browser. Unlike handleUtterance, it does not run the STT/brain
+// pipeline — it speaks the given text directly.
+func (p *govorilkaPeer) speakReply(text string) {
+	frames, err := voicekit.TTSYandex(text)
+	if err != nil {
+		log.Printf("govorilka: reply TTS: %v", err)
+		return
+	}
+	log.Printf("govorilka: reply-voice: %q (%d frames)", text, len(frames))
+
+	p.mu.Lock()
+	out := p.outTrack
+	seq := p.seq
+	ts := p.ts
+	p.mu.Unlock()
+	if out == nil {
+		return
+	}
+	ssrc := uint32(4242)
+	for _, f := range frames {
+		pkt := &rtp.Packet{
+			Header: rtp.Header{
+				Version:        2,
+				PayloadType:    111,
+				SequenceNumber: seq,
+				Timestamp:      ts,
+				SSRC:           ssrc,
+			},
+			Payload: f,
+		}
+		if err := out.WriteRTP(pkt); err != nil {
+			return
+		}
+		seq++
+		ts += 960
+		time.Sleep(20 * time.Millisecond)
+	}
+	p.mu.Lock()
+	p.seq = seq
+	p.ts = ts
+	p.mu.Unlock()
+}
+
+// playClick sends a short feedback tone ("tack") to the browser so the user
+// knows what is happening: low (1200Hz) = phrase accepted, high (1800Hz) =
+// reply ready. Uses the same outTrack and RTP wrapping as replies.
+func (p *govorilkaPeer) playClick(freq, amp float64) {
+	p.mu.Lock()
+	out := p.outTrack
+	p.mu.Unlock()
+	if out == nil {
+		return
+	}
+
+	// 60ms tone with fast decay.
+	const clickDur = 60 * time.Millisecond
+	const sr = 48000.0
+	n := int(sr * clickDur.Seconds())
+	clickPCM := make([]int16, n)
+	for i := 0; i < n; i++ {
+		t := float64(i) / sr
+		env := math.Exp(-t * 80)
+		clickPCM[i] = int16(amp * math.Sin(2*math.Pi*freq*t) * env)
+	}
+
+	enc, err := opus.NewEncoder(48000, 1, opus.AppVoIP)
+	if err != nil {
+		return
+	}
+	var frames [][]byte
+	buf := make([]byte, 10000)
+	for i := 0; i+960 <= n; i += 960 {
+		outN, err := enc.Encode(clickPCM[i:i+960], buf)
+		if err != nil {
+			return
+		}
+		f := make([]byte, outN)
+		copy(f, buf[:outN])
+		frames = append(frames, f)
+	}
+	if len(frames) == 0 {
+		return
+	}
+
+	p.mu.Lock()
+	seq := p.seq
+	ts := p.ts
+	p.mu.Unlock()
+	ssrc := uint32(4242)
+	for _, f := range frames {
+		pkt := &rtp.Packet{
+			Header: rtp.Header{
+				Version:        2,
+				PayloadType:    111,
+				SequenceNumber: seq,
+				Timestamp:      ts,
+				SSRC:           ssrc,
+			},
+			Payload: f,
+		}
+		if err := out.WriteRTP(pkt); err != nil {
+			return
+		}
+		seq++
+		ts += 960
+		time.Sleep(20 * time.Millisecond)
 	}
 	p.mu.Lock()
 	p.seq = seq
