@@ -80,16 +80,16 @@ func (p *govorilkaPeer) handleUtterance(pcm []int16) {
 
 	// Voice commands handled locally (mirror the Discord bot):
 	cmd := voicekit.MatchCommand(text)
+	switch cmd {
 	// "стоп" interrupts playback without muting.
-	if cmd == "стоп" {
+	case "стоп":
 		log.Printf("govorilka: interrupt command: стоп")
 		p.mu.Lock()
 		p.interrupt = true
 		p.mu.Unlock()
 		return
-	}
 	// "продолжаем" and "повтори" work even while muted.
-	if cmd == "продолжаем" {
+	case "продолжаем":
 		p.mu.Lock()
 		p.muted = false
 		p.interrupt = true
@@ -97,8 +97,7 @@ func (p *govorilkaPeer) handleUtterance(pcm []int16) {
 		log.Printf("govorilka: muted OFF")
 		p.speakReply("Продолжаем.")
 		return
-	}
-	if cmd == "повтори" {
+	case "повтори":
 		p.mu.Lock()
 		last := p.lastReply
 		p.muted = false
@@ -112,6 +111,7 @@ func (p *govorilkaPeer) handleUtterance(pcm []int16) {
 		}
 		return
 	}
+
 	// While muted, ignore everything else.
 	p.mu.Lock()
 	muted := p.muted
@@ -120,6 +120,7 @@ func (p *govorilkaPeer) handleUtterance(pcm []int16) {
 		log.Printf("govorilka: muted, ignoring: %q", text)
 		return
 	}
+
 	if cmd == "молчи" {
 		p.mu.Lock()
 		p.muted = true

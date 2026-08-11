@@ -597,17 +597,15 @@ func (b *bot) handleVoiceCommand(vc *discordgo.VoiceConnection, text string) boo
 	cmd := matchCommand(text)
 
 	// Commands that work even while muted:
-
+	switch cmd {
 	// "Продолжаем" un-mutes.
-	if cmd == "продолжаем" {
+	case "продолжаем":
 		b.setMuted(false)
 		log.Printf("voice: command: muted OFF")
 		b.speak(vc, "Продолжаем.")
 		return true
-	}
-
 	// "Повтори" also un-mutes (so it works after "молчи") and replays.
-	if cmd == "повтори" {
+	case "повтори":
 		b.setMuted(false)
 		log.Printf("voice: command: muted OFF (повтори)")
 		b.mu.Lock()
