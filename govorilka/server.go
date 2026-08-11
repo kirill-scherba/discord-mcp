@@ -59,15 +59,6 @@ type govorilkaPeer struct {
 // while a long reply is being sent, a new utterance waits (otherwise two
 // goroutines would write RTP concurrently and corrupt playback).
 func (p *govorilkaPeer) handleUtterance(pcm []int16) {
-	// Tail rejection: if a previous utterance is still being processed
-	// (STT/brain/TTS in flight), a new short phrase is its tail — drop it
-	// instead of queueing a confusing second reply.
-	if !p.sendMu.TryLock() {
-		log.Printf("govorilka: tail dropped (previous still processing)")
-		return
-	}
-	defer p.sendMu.Unlock()
-
 	log.Printf("govorilka: handleUtterance, %d samples (%.1f ms)", len(pcm), float64(len(pcm))/48.0)
 	if len(pcm) < 48000/4 { // ignore sub-250ms blips
 		return
@@ -139,6 +130,15 @@ func (p *govorilkaPeer) handleUtterance(pcm []int16) {
 		return
 	}
 
+	// Tail rejection for ordinary speech: if a previous reply is still being
+	// sent, this is a tail of the same phrase — drop it. Commands above are
+	// NOT dropped (they must break through to interrupt/mute).
+	if !p.sendMu.TryLock() {
+		log.Printf("govorilka: tail dropped (previous still processing)")
+		return
+	}
+	defer p.sendMu.Unlock()
+
 	// ПИК-1 (низкий): фраза принята и отправлена на обработку.
 	p.playClick(1200, 6000)
 
@@ -175,6 +175,12 @@ func (p *govorilkaPeer) handleUtterance(pcm []int16) {
 
 	// ПИК-2 (высокий): ответ готов, сейчас озвучится.
 	p.playClick(1800, 6000)
+
+	// Clear any stale interrupt flag before starting playback (a previous
+	// "стоп" must not kill this reply).
+	p.mu.Lock()
+	p.interrupt = false
+	p.mu.Unlock()
 
 	p.mu.Lock()
 	out := p.outTrack
@@ -236,6 +242,7 @@ func (p *govorilkaPeer) speakReply(text string) {
 	log.Printf("govorilka: reply-voice: %q (%d frames)", text, len(frames))
 
 	p.mu.Lock()
+	p.interrupt = false
 	out := p.outTrack
 	seq := p.seq
 	ts := p.ts
