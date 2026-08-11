@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
@@ -38,10 +39,13 @@ type govorilkaPeer struct {
 // handleUtterance runs the voice pipeline for one utterance and sends the
 // synthesized reply back over the output track.
 func (p *govorilkaPeer) handleUtterance(pcm []int16) {
+	log.Printf("govorilka: handleUtterance, %d samples (%.1f ms)", len(pcm), float64(len(pcm))/48.0)
 	if len(pcm) < 48000/4 { // ignore sub-250ms blips
 		return
 	}
 	wav := voicekit.PCMToWAV(pcm)
+	// Save the last utterance for debugging (voice quality check).
+	os.WriteFile("/tmp/govorilka_last.wav", wav, 0o644)
 	text, err := voicekit.Transcribe(wav)
 	if err != nil {
 		log.Printf("govorilka: STT: %v", err)
@@ -49,6 +53,7 @@ func (p *govorilkaPeer) handleUtterance(pcm []int16) {
 	}
 	text = voicekit.TrimWhitespace(text)
 	if text == "" {
+		log.Printf("govorilka: STT empty (noise), %dms audio", len(pcm)/48)
 		return
 	}
 	log.Printf("govorilka: heard: %q", text)
@@ -132,19 +137,10 @@ func govorilkaSignal(w http.ResponseWriter, r *http.Request) {
 
 	peer := &govorilkaPeer{pc: pc}
 
-	// Create the output track that will carry the echo audio back.
-	outTrack, err := webrtc.NewTrackLocalStaticRTP(
-		webrtc.RTPCodecCapability{MimeType: "audio/opus", ClockRate: 48000, Channels: 2},
-		"echo", "govorilka")
-	if err != nil {
-		log.Printf("govorilka: out track: %v", err)
-		return
-	}
-	peer.outTrack = outTrack
-	if _, err := pc.AddTrack(outTrack); err != nil {
-		log.Printf("govorilka: add track: %v", err)
-		return
-	}
+	// Output track is NOT added yet: adding it makes the browser echo its
+	// own microphone back (audioEl.srcObject = received stream) causing an
+	// infinite acoustic loop (RMS ~30000 even in silence). The reply track
+	// will be added when we actually have something to send.
 
 	// Handle incoming microphone track: decode Opus, detect utterance end,
 	// run STT -> brain -> TTS, send the reply back over the output track.
@@ -156,41 +152,80 @@ func govorilkaSignal(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var pcm []int16
-		var lastSpeech time.Time
 		active := false
-		rtpBuf := make([]byte, 1600)
 		pcmBuf := make([]int16, 960)
+		var mu sync.Mutex
+		pktCount := 0
+
+		// WebRTC browsers do NOT send silence packets — the track only carries
+		// actual speech. A timer goroutine finalizes the utterance 500ms after
+		// the last speech packet (track.Read blocks, so the main loop can't
+		// notice silence itself).
+		timer := time.NewTimer(time.Hour)
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		go func() {
+			for {
+				<-timer.C
+				mu.Lock()
+				if active {
+					utterance := pcm
+					pcm = nil
+					active = false
+					mu.Unlock()
+					log.Printf("govorilka: timer fired, utterance %d samples", len(utterance))
+					go peer.handleUtterance(utterance)
+				} else {
+					mu.Unlock()
+				}
+				timer.Reset(time.Hour)
+			}
+		}()
+
 		for {
-			n, _, err := track.Read(rtpBuf)
+			rtpPacket, _, err := track.ReadRTP()
 			if err != nil {
 				log.Printf("govorilka: track read: %v", err)
 				return
 			}
-			// RTP header is 12 bytes; the rest is the Opus payload.
-			payload := rtpBuf[12:n]
+			pktCount++
+			if pktCount <= 3 {
+				pl := rtpPacket.Payload
+				if len(pl) > 5 {
+					log.Printf("govorilka: pkt%d payload6=%02x %02x %02x %02x %02x %02x payloadLen=%d",
+						pktCount, pl[0], pl[1], pl[2], pl[3], pl[4], pl[5], len(pl))
+				}
+			}
+			// rtpPacket.Payload is the raw Opus data (pion parsed the RTP
+			// header, including any extension).
+			payload := rtpPacket.Payload
 			// Decode Opus payload -> PCM (20ms frame).
 			decoded, derr := dec.Decode(payload, pcmBuf)
 			if derr != nil || decoded == 0 {
 				continue
 			}
 			rms := voicekit.RMSInt16(pcmBuf[:decoded])
-			if rms > 800 {
+			if pktCount%50 == 1 || rms < 5000 {
+				log.Printf("govorilka: pkt decoded=%d rms=%.0f active=%v", decoded, rms, active)
+			}
+			mu.Lock()
+			if rms > 300 {
 				pcm = append(pcm, pcmBuf[:decoded]...)
-				lastSpeech = time.Now()
 				if !active {
 					active = true
 				}
+				// Reset the end-of-utterance timer only on speech, not on
+				// silence packets — otherwise continuous silence keeps
+				// restarting the 500ms timer forever.
+				timer.Reset(500 * time.Millisecond)
 			} else if active {
 				pcm = append(pcm, pcmBuf[:decoded]...)
 			}
-			// Utterance end: 500ms silence or 28s cap.
-			if active && (time.Since(lastSpeech) > 500*time.Millisecond ||
-				len(pcm) > 28*48000) {
-				utterance := pcm
-				pcm = nil
-				active = false
-				go peer.handleUtterance(utterance)
-			}
+			mu.Unlock()
 		}
 	})
 
