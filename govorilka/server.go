@@ -19,6 +19,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/hraban/opus"
 	"github.com/kirill-scherba/discord-mcp/voicekit"
+	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -92,11 +93,28 @@ func (p *govorilkaPeer) handleUtterance(pcm []int16) {
 	if out == nil {
 		return
 	}
+	// TrackLocalStaticRTP.Write expects a full RTP packet (header+payload).
+	// Wrap each Opus frame in an RTP packet with SSRC/seq/timestamp.
+	ssrc := uint32(4242)
+	seq := uint16(0)
+	ts := uint32(0)
 	for _, f := range frames {
-		if _, err := out.Write(f); err != nil {
+		pkt := &rtp.Packet{
+			Header: rtp.Header{
+				Version:        2,
+				PayloadType:    111, // Opus
+				SequenceNumber: seq,
+				Timestamp:      ts,
+				SSRC:           ssrc,
+			},
+			Payload: f,
+		}
+		if err := out.WriteRTP(pkt); err != nil {
 			log.Printf("govorilka: out write: %v", err)
 			return
 		}
+		seq++
+		ts += 960 // 20ms at 48kHz
 	}
 }
 
@@ -137,10 +155,21 @@ func govorilkaSignal(w http.ResponseWriter, r *http.Request) {
 
 	peer := &govorilkaPeer{pc: pc}
 
-	// Output track is NOT added yet: adding it makes the browser echo its
-	// own microphone back (audioEl.srcObject = received stream) causing an
-	// infinite acoustic loop (RMS ~30000 even in silence). The reply track
-	// will be added when we actually have something to send.
+	// Output track carries the synthesized reply back to the browser.
+	// The earlier acoustic loop was caused by HTML auto-playing the received
+	// stream (srcObject = own mic); that was removed, so the track is safe.
+	outTrack, err := webrtc.NewTrackLocalStaticRTP(
+		webrtc.RTPCodecCapability{MimeType: "audio/opus", ClockRate: 48000, Channels: 2},
+		"reply", "govorilka")
+	if err != nil {
+		log.Printf("govorilka: out track: %v", err)
+		return
+	}
+	peer.outTrack = outTrack
+	if _, err := pc.AddTrack(outTrack); err != nil {
+		log.Printf("govorilka: add track: %v", err)
+		return
+	}
 
 	// Handle incoming microphone track: decode Opus, detect utterance end,
 	// run STT -> brain -> TTS, send the reply back over the output track.

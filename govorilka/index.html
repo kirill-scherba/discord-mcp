@@ -79,11 +79,16 @@ connectBtn.onclick = async () => {
   // Микрофон → аудио-трек на сервер
   stream.getAudioTracks().forEach(t => pc.addTrack(t, stream));
 
-  // Ответ сервера (эхо) → плеер. Пока сервер не шлёт реальный ответ,
-  // НЕ воспроизводим входящий трек — иначе браузер зацикливает свой же
-  // микрофон (audioEl.srcObject = ev.streams[0] → петля).
+  // Ответ сервера (TTS-речь) → плеер. Это отдельный трек от сервера (не
+  // наш микрофон), поэтому воспроизводим его. Петля раньше была из-за
+  // srcObject = собственный микрофон; теперь трек другой.
   pc.ontrack = (ev) => {
-    log('Трек получен от сервера (не воспроизводим до ответа)');
+    log('Трек ответа получен от сервера');
+    const audio = document.createElement('audio');
+    audio.autoplay = true;
+    audio.srcObject = ev.streams[0];
+    document.body.appendChild(audio);
+    audio.onended = () => audio.remove();
   };
 
   pc.onicecandidate = (ev) => { if (ev.candidate) signal('candidate', ev.candidate.toJSON()); };
