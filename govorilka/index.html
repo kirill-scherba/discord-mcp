@@ -79,17 +79,19 @@ connectBtn.onclick = async () => {
   // Микрофон → аудио-трек на сервер
   stream.getAudioTracks().forEach(t => pc.addTrack(t, stream));
 
-  // Ответ сервера (TTS-речь) → плеер. Это отдельный трек от сервера (не
-  // наш микрофон), поэтому воспроизводим его. Петля раньше была из-за
-  // srcObject = собственный микрофон; теперь трек другой.
+  // Ответ сервера (TTS-речь) → плеер. Один audio-элемент на всё
+  // соединение: пересоздание в каждом ontrack ломает autoplay в Chrome.
+  const replyAudio = document.createElement('audio');
+  replyAudio.autoplay = true;
+  document.body.appendChild(replyAudio);
   pc.ontrack = (ev) => {
     log('Трек ответа получен от сервера');
-    const audio = document.createElement('audio');
-    audio.autoplay = true;
-    audio.srcObject = ev.streams[0];
-    document.body.appendChild(audio);
-    audio.onended = () => audio.remove();
+    replyAudio.srcObject = ev.streams[0];
+    replyAudio.play().then(() => {
+      log('Воспроизведение началось');
+    }).catch(e => log('Play blocked: ' + e.message));
   };
+  replyAudio.onerror = (e) => log('Audio error: ' + (e.target.error ? e.target.error.message : 'unknown'));
 
   pc.onicecandidate = (ev) => { if (ev.candidate) signal('candidate', ev.candidate.toJSON()); };
   pc.onconnectionstatechange = () => log('Состояние: ' + pc.connectionState);

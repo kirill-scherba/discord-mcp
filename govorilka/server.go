@@ -35,11 +35,27 @@ type govorilkaPeer struct {
 	mu       sync.Mutex
 	pc       *webrtc.PeerConnection
 	outTrack *webrtc.TrackLocalStaticRTP
+
+	// sendMu serializes the full utterance pipeline + playback: if the user
+	// speaks while a long reply is still being sent, a second goroutine
+	// would write RTP packets concurrently and corrupt the stream.
+	sendMu sync.Mutex
+
+	// RTP sequence/timestamp counters persist across replies. Resetting
+	// them per-utterance makes the browser treat later packets as stale
+	// (seq wraps to 0) and silently drop them — only the first reply plays.
+	seq uint16
+	ts  uint32
 }
 
 // handleUtterance runs the voice pipeline for one utterance and sends the
-// synthesized reply back over the output track.
+// synthesized reply back over the output track. Serialized via sendMu:
+// while a long reply is being sent, a new utterance waits (otherwise two
+// goroutines would write RTP concurrently and corrupt playback).
 func (p *govorilkaPeer) handleUtterance(pcm []int16) {
+	p.sendMu.Lock()
+	defer p.sendMu.Unlock()
+
 	log.Printf("govorilka: handleUtterance, %d samples (%.1f ms)", len(pcm), float64(len(pcm))/48.0)
 	if len(pcm) < 48000/4 { // ignore sub-250ms blips
 		return
@@ -89,15 +105,18 @@ func (p *govorilkaPeer) handleUtterance(pcm []int16) {
 
 	p.mu.Lock()
 	out := p.outTrack
+	seq := p.seq
+	ts := p.ts
 	p.mu.Unlock()
 	if out == nil {
 		return
 	}
 	// TrackLocalStaticRTP.Write expects a full RTP packet (header+payload).
 	// Wrap each Opus frame in an RTP packet with SSRC/seq/timestamp.
+	// seq/ts persist across replies (see struct comment). Pace at real-time
+	// speed (20ms per frame) so the browser jitter buffer is not flooded.
 	ssrc := uint32(4242)
-	seq := uint16(0)
-	ts := uint32(0)
+	frameDur := 20 * time.Millisecond
 	for _, f := range frames {
 		pkt := &rtp.Packet{
 			Header: rtp.Header{
@@ -115,7 +134,12 @@ func (p *govorilkaPeer) handleUtterance(pcm []int16) {
 		}
 		seq++
 		ts += 960 // 20ms at 48kHz
+		time.Sleep(frameDur)
 	}
+	p.mu.Lock()
+	p.seq = seq
+	p.ts = ts
+	p.mu.Unlock()
 }
 
 // startGovorilka launches the prototype server (non-blocking).
