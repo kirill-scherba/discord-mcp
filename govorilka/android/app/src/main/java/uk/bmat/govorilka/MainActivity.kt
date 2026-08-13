@@ -6,6 +6,7 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.util.Log
 import android.webkit.PermissionRequest
 import android.webkit.WebChromeClient
 import android.webkit.WebSettings
@@ -66,6 +67,27 @@ class MainActivity : AppCompatActivity() {
 
     override fun onBackPressed() {
         if (webView.canGoBack()) webView.goBack() else super.onBackPressed()
+    }
+
+    // --- Diagnostics: lifecycle logging to see what happens in background ---
+    override fun onPause() {
+        super.onPause()
+        Log.d("Govorilka", "onPause: приложение уходит в фон")
+    }
+
+    override fun onStop() {
+        super.onStop()
+        Log.d("Govorilka", "onStop: приложение остановлено")
+    }
+
+    override fun onResume() {
+        super.onResume()
+        Log.d("Govorilka", "onResume: приложение снова активно, url=${webView.url}")
+    }
+
+    override fun onDestroy() {
+        Log.d("Govorilka", "onDestroy: приложение уничтожается")
+        super.onDestroy()
     }
 
     private fun startVoiceService() {
