@@ -18,7 +18,6 @@ import androidx.core.app.NotificationCompat
 import org.json.JSONObject
 import org.webrtc.AudioSource
 import org.webrtc.AudioTrack
-import org.webrtc.AudioTrackSink
 import org.webrtc.DefaultVideoDecoderFactory
 import org.webrtc.DefaultVideoEncoderFactory
 import org.webrtc.EglBase
@@ -31,10 +30,12 @@ import org.webrtc.RTCStatsReport
 import org.webrtc.SessionDescription
 import org.webrtc.VideoDecoderFactory
 import org.webrtc.VideoEncoderFactory
-import java.net.URI
-import java.nio.ByteBuffer
-import org.java_websocket.client.WebSocketClient
-import org.java_websocket.handshake.ServerHandshake
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.Response
+import okhttp3.WebSocket
+import okhttp3.WebSocketListener
+import okio.ByteString
 
 /**
  * Foreground service with NATIVE WebRTC (not WebView) — keeps the mic alive
@@ -48,7 +49,8 @@ class VoiceService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
     private var handlerThread: HandlerThread? = null
     private var handler: Handler? = null
-    private var ws: WebSocketClient? = null
+    private var ws: WebSocket? = null
+    private var wsHttpClient: OkHttpClient? = null
 
     // WebRTC
     private var factory: PeerConnectionFactory? = null
@@ -58,53 +60,24 @@ class VoiceService : Service() {
     private var localStream: MediaStream? = null
     private var eglBase: EglBase? = null
 
-    // Native playback of the server's reply (survives backgrounding).
-    private var audioTrackOut: android.media.AudioTrack? = null
-    private val remoteAudioSink = object : AudioTrackSink {
-        override fun onData(
-            audioData: ByteBuffer, samplingRate: Int, channels: Int,
-            samplesPerChannel: Int, bytesPerSample: Int, timestamp: Long
-        ) {
-            val bytes = ByteArray(audioData.remaining())
-            audioData.get(bytes)
-            ensureAudioTrack(samplingRate, channels)
-            audioTrackOut?.write(bytes, 0, bytes.size)
-        }
-    }
-
-    private fun ensureAudioTrack(samplingRate: Int, channels: Int) {
-        if (audioTrackOut != null) return
-        val channelConfig = if (channels == 2) {
-            android.media.AudioFormat.CHANNEL_OUT_STEREO
-        } else {
-            android.media.AudioFormat.CHANNEL_OUT_MONO
-        }
-        val minBuf = android.media.AudioTrack.getMinBufferSize(
-            samplingRate, channelConfig, android.media.AudioFormat.ENCODING_PCM_16BIT
-        )
-        audioTrackOut = android.media.AudioTrack.Builder()
-            .setAudioAttributes(
-                android.media.AudioAttributes.Builder()
-                    .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
-                    .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SPEECH)
-                    .build()
-            )
-            .setAudioFormat(
-                android.media.AudioFormat.Builder()
-                    .setSampleRate(samplingRate)
-                    .setEncoding(android.media.AudioFormat.ENCODING_PCM_16BIT)
-                    .setChannelMask(channelConfig)
-                    .build()
-            )
-            .setBufferSizeInBytes(maxOf(minBuf, 4096))
-            .build()
-        audioTrackOut?.play()
-    }
+    // Native playback of the server's reply is handled by WebRTC itself
+    // (WebRtcAudioTrack -> Java AudioTrack), which works in the background
+    // thanks to the foreground service. No custom AudioTrack sink needed.
 
     override fun onCreate() {
         super.onCreate()
         Log.d("Govorilka", "VoiceService onCreate")
         acquireWakeLock()
+        // Voice-communication audio mode: routes the WebRTC output track to
+        // the speaker when the screen is off / app is backgrounded. Without
+        // MODE_IN_COMMUNICATION, the USAGE_VOICE_COMMUNICATION AudioTrack is
+        // created but stays silent (audio mode stays MODE_NORMAL).
+        val am = getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
+        am.mode = android.media.AudioManager.MODE_IN_COMMUNICATION
+        // Route the voice-communication stream to the loudspeaker (rear
+        // speaker) instead of the earpiece (the one you put to your ear).
+        am.isSpeakerphoneOn = true
+        Log.d("Govorilka", "audio mode: MODE_IN_COMMUNICATION, speakerphone: ${am.isSpeakerphoneOn}")
         handlerThread = HandlerThread("govorilka-webrtc").apply { start() }
         handler = Handler(handlerThread!!.looper)
         initializeWebRTC()
@@ -119,9 +92,12 @@ class VoiceService : Service() {
 
     override fun onDestroy() {
         disconnect()
-        audioTrackOut?.stop()
-        audioTrackOut?.release()
-        audioTrackOut = null
+        // Restore normal audio mode so the device is not left in the
+        // communication (call) state after the service stops.
+        try {
+            val am = getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
+            am.mode = android.media.AudioManager.MODE_NORMAL
+        } catch (_: Exception) {}
         handlerThread?.quitSafely()
         wakeLock?.let { if (it.isHeld) it.release() }
         super.onDestroy()
@@ -183,12 +159,12 @@ class VoiceService : Service() {
             override fun onAddTrack(receiver: org.webrtc.RtpReceiver?, streams: Array<out MediaStream>?) {}
             override fun onRemoveTrack(receiver: org.webrtc.RtpReceiver?) {}
             override fun onTrack(transceiver: org.webrtc.RtpTransceiver?) {
-                // Play the server's reply audio natively (not via WebView) so
-                // it survives long background periods.
+                // WebRTC plays the server's reply audio natively via its own
+                // WebRtcAudioTrack -> Java AudioTrack. It survives background
+                // periods thanks to the foreground service; no extra sink.
                 val track = transceiver?.receiver?.track()
                 if (track is AudioTrack) {
-                    Log.d("Govorilka", "onTrack: playing remote audio natively")
-                    track.addSink(remoteAudioSink)
+                    Log.d("Govorilka", "onTrack: remote audio track (WebRTC plays it)")
                 }
             }
             override fun onConnectionChange(newState: PeerConnection.PeerConnectionState?) {
@@ -207,41 +183,68 @@ class VoiceService : Service() {
             disconnect()
             pc = createPeerConnection()
             try {
-                ws = object : WebSocketClient(URI("wss://govorilka.bmat.uk/signal")) {
-                    override fun onOpen(handshakedata: ServerHandshake?) {
+                val client = OkHttpClient.Builder()
+                    .pingInterval(30, java.util.concurrent.TimeUnit.SECONDS)
+                    .build()
+                wsHttpClient = client
+                val request = Request.Builder()
+                    .url("wss://govorilka.bmat.uk/signal")
+                    .build()
+                ws = client.newWebSocket(request, object : WebSocketListener() {
+                    override fun onOpen(webSocket: WebSocket, response: Response) {
                         Log.d("Govorilka", "WS open, sending offer")
                         val pc = this@VoiceService.pc
                         if (pc != null) {
                             pc.createOffer(object : org.webrtc.SdpObserver {
                                 override fun onCreateSuccess(desc: SessionDescription?) {
-                                    sendSignal(JSONObject().apply {
-                                        put("signal", "offer")
-                                        put("data", JSONObject().apply {
-                                            put("type", desc?.type?.canonicalForm())
-                                            put("sdp", desc?.description)
-                                        })
-                                    }.toString())
+                                    Log.d("Govorilka", "offer created, setLocalDescription")
+                                    pc.setLocalDescription(object : org.webrtc.SdpObserver {
+                                        override fun onCreateSuccess(desc: SessionDescription?) {}
+                                        override fun onSetSuccess() {
+                                            Log.d("Govorilka", "setLocalDescription ok, sending offer")
+                                            sendSignal(JSONObject().apply {
+                                                put("signal", "offer")
+                                                put("data", JSONObject().apply {
+                                                    put("type", desc?.type?.canonicalForm())
+                                                    put("sdp", desc?.description)
+                                                })
+                                            }.toString())
+                                        }
+                                        override fun onCreateFailure(p0: String?) {
+                                            Log.d("Govorilka", "setLocal create fail: $p0")
+                                        }
+                                        override fun onSetFailure(p0: String?) {
+                                            Log.d("Govorilka", "setLocal set fail: $p0")
+                                        }
+                                    }, desc)
                                 }
                                 override fun onSetSuccess() {}
-                                override fun onCreateFailure(p0: String?) {}
-                                override fun onSetFailure(p0: String?) {}
+                                override fun onCreateFailure(p0: String?) {
+                                    Log.d("Govorilka", "createOffer fail: $p0")
+                                }
+                                override fun onSetFailure(p0: String?) {
+                                    Log.d("Govorilka", "createOffer set fail: $p0")
+                                }
                             }, MediaConstraints())
                         }
                     }
 
-                    override fun onMessage(message: String?) {
-                        handler?.post { handleSignal(message) }
+                    override fun onMessage(webSocket: WebSocket, text: String) {
+                        handler?.post { handleSignal(text) }
                     }
 
-                    override fun onClose(code: Int, reason: String?, remote: Boolean) {
+                    override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                         Log.d("Govorilka", "WS closed: $code $reason")
                     }
 
-                    override fun onError(ex: Exception?) {
-                        Log.d("Govorilka", "WS error: ${ex?.message}")
+                    override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                        Log.d("Govorilka", "WS closing: $code $reason")
                     }
-                }
-                ws!!.connect()
+
+                    override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                        Log.d("Govorilka", "WS failure: ${t.message}")
+                    }
+                })
             } catch (e: Exception) {
                 Log.d("Govorilka", "WS connect error: ${e.message}")
             }
@@ -285,8 +288,10 @@ class VoiceService : Service() {
     }
 
     private fun disconnect() {
-        ws?.close()
+        ws?.close(1000, "bye")
         ws = null
+        wsHttpClient?.dispatcher?.executorService?.shutdown()
+        wsHttpClient = null
         pc?.close()
         pc = null
     }

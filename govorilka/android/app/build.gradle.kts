@@ -34,5 +34,5 @@ dependencies {
     implementation("androidx.appcompat:appcompat:1.6.1")
     implementation("androidx.webkit:webkit:1.9.0")
     implementation("io.github.webrtc-sdk:android:125.6422.04")
-    implementation("org.java-websocket:Java-WebSocket:1.5.4")
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
 }
