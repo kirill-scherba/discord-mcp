@@ -53,7 +53,11 @@ class VoiceService : Service() {
         }
     }
 
+    private var isForeground = false
+
     private fun startForegroundCompat() {
+        if (isForeground) return
+        isForeground = true
         val channelId = "govorilka"
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(

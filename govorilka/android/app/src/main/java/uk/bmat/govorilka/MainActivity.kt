@@ -34,7 +34,6 @@ class MainActivity : AppCompatActivity() {
             ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.RECORD_AUDIO), 1)
         } else {
             startVoiceService()
-            webView.loadUrl(GOVORILKA_URL)
         }
     }
 
@@ -44,7 +43,6 @@ class MainActivity : AppCompatActivity() {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
             startVoiceService()
-            webView.loadUrl(GOVORILKA_URL)
         }
     }
 
@@ -58,7 +56,7 @@ class MainActivity : AppCompatActivity() {
         // Разрешить getUserMedia (микрофон) внутри WebView.
         webView.webChromeClient = object : WebChromeClient() {
             override fun onPermissionRequest(request: PermissionRequest) {
-                // WebRTC: grant mic + camera (camera не нужна, но на всякий).
+                // WebRTC: grant mic (camera не нужна).
                 request.grant(request.resources)
             }
         }
@@ -73,6 +71,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startVoiceService() {
+        // Запускаем только один раз — иначе повторный startForegroundService
+        // может упасть (ServiceNotFoundException / duplicate).
+        if (serviceStarted) return
+        serviceStarted = true
         val intent = Intent(this, VoiceService::class.java)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             startForegroundService(intent)
@@ -82,6 +84,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     companion object {
+        private var serviceStarted = false
         // Временный URL — пока WebRTC-сервер на нашем домене.
         private const val GOVORILKA_URL = "https://govorilka.bmat.uk"
     }
