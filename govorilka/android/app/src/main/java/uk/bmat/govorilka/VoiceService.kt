@@ -18,6 +18,7 @@ import androidx.core.app.NotificationCompat
 import org.json.JSONObject
 import org.webrtc.AudioSource
 import org.webrtc.AudioTrack
+import org.webrtc.AudioTrackSink
 import org.webrtc.DefaultVideoDecoderFactory
 import org.webrtc.DefaultVideoEncoderFactory
 import org.webrtc.EglBase
@@ -31,6 +32,7 @@ import org.webrtc.SessionDescription
 import org.webrtc.VideoDecoderFactory
 import org.webrtc.VideoEncoderFactory
 import java.net.URI
+import java.nio.ByteBuffer
 import org.java_websocket.client.WebSocketClient
 import org.java_websocket.handshake.ServerHandshake
 
@@ -56,6 +58,49 @@ class VoiceService : Service() {
     private var localStream: MediaStream? = null
     private var eglBase: EglBase? = null
 
+    // Native playback of the server's reply (survives backgrounding).
+    private var audioTrackOut: android.media.AudioTrack? = null
+    private val remoteAudioSink = object : AudioTrackSink {
+        override fun onData(
+            audioData: ByteBuffer, samplingRate: Int, channels: Int,
+            samplesPerChannel: Int, bytesPerSample: Int, timestamp: Long
+        ) {
+            val bytes = ByteArray(audioData.remaining())
+            audioData.get(bytes)
+            ensureAudioTrack(samplingRate, channels)
+            audioTrackOut?.write(bytes, 0, bytes.size)
+        }
+    }
+
+    private fun ensureAudioTrack(samplingRate: Int, channels: Int) {
+        if (audioTrackOut != null) return
+        val channelConfig = if (channels == 2) {
+            android.media.AudioFormat.CHANNEL_OUT_STEREO
+        } else {
+            android.media.AudioFormat.CHANNEL_OUT_MONO
+        }
+        val minBuf = android.media.AudioTrack.getMinBufferSize(
+            samplingRate, channelConfig, android.media.AudioFormat.ENCODING_PCM_16BIT
+        )
+        audioTrackOut = android.media.AudioTrack.Builder()
+            .setAudioAttributes(
+                android.media.AudioAttributes.Builder()
+                    .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
+                    .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build()
+            )
+            .setAudioFormat(
+                android.media.AudioFormat.Builder()
+                    .setSampleRate(samplingRate)
+                    .setEncoding(android.media.AudioFormat.ENCODING_PCM_16BIT)
+                    .setChannelMask(channelConfig)
+                    .build()
+            )
+            .setBufferSizeInBytes(maxOf(minBuf, 4096))
+            .build()
+        audioTrackOut?.play()
+    }
+
     override fun onCreate() {
         super.onCreate()
         acquireWakeLock()
@@ -72,6 +117,9 @@ class VoiceService : Service() {
 
     override fun onDestroy() {
         disconnect()
+        audioTrackOut?.stop()
+        audioTrackOut?.release()
+        audioTrackOut = null
         handlerThread?.quitSafely()
         wakeLock?.let { if (it.isHeld) it.release() }
         super.onDestroy()
@@ -132,7 +180,15 @@ class VoiceService : Service() {
             override fun onRenegotiationNeeded() {}
             override fun onAddTrack(receiver: org.webrtc.RtpReceiver?, streams: Array<out MediaStream>?) {}
             override fun onRemoveTrack(receiver: org.webrtc.RtpReceiver?) {}
-            override fun onTrack(transceiver: org.webrtc.RtpTransceiver?) {}
+            override fun onTrack(transceiver: org.webrtc.RtpTransceiver?) {
+                // Play the server's reply audio natively (not via WebView) so
+                // it survives long background periods.
+                val track = transceiver?.receiver?.track()
+                if (track is AudioTrack) {
+                    Log.d("Govorilka", "onTrack: playing remote audio natively")
+                    track.addSink(remoteAudioSink)
+                }
+            }
             override fun onConnectionChange(newState: PeerConnection.PeerConnectionState?) {
                 Log.d("Govorilka", "PC state: $newState")
             }
