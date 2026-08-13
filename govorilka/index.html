@@ -105,6 +105,16 @@ async function connect() {
   pc.onicecandidate = (ev) => { if (ev.candidate) signal('candidate', ev.candidate.toJSON()); };
   pc.onconnectionstatechange = () => {
     log('Состояние: ' + pc.connectionState);
+    if (pc.connectionState === 'connected') {
+      // WebSocket больше не нужен (звук идёт по WebRTC напрямую).
+      // Закрываем его сами, чтобы его закрытие не вызывало реконнект.
+      if (ws) {
+        ws.onclose = null;
+        ws.close();
+        ws = null;
+        log('Сигналинг закрыт (не нужен после соединения).');
+      }
+    }
     // Автопереподключение при обрыве: disconnected/failed → пересоздать.
     if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') {
       log('Соединение потеряно, переподключаюсь...');
@@ -128,10 +138,6 @@ async function connect() {
     } else if (msg.signal === 'candidate') {
       await pc.addIceCandidate(msg.data);
     }
-  };
-  ws.onclose = () => {
-    log('Сигналинг закрыт, переподключаюсь...');
-    if (connectBtn.disabled) setTimeout(() => reconnect(), 1500);
   };
 
   connectBtn.disabled = true;
