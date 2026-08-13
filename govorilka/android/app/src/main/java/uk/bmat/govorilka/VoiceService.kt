@@ -103,6 +103,7 @@ class VoiceService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        Log.d("Govorilka", "VoiceService onCreate")
         acquireWakeLock()
         handlerThread = HandlerThread("govorilka-webrtc").apply { start() }
         handler = Handler(handlerThread!!.looper)
@@ -110,6 +111,7 @@ class VoiceService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        Log.d("Govorilka", "VoiceService onStartCommand")
         startForegroundCompat()
         connect()
         return START_STICKY
