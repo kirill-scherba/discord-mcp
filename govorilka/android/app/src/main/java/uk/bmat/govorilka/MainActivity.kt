@@ -23,8 +23,27 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        // WebView + плавающая кнопка «Стоп» поверх.
+        val root = android.widget.FrameLayout(this)
         webView = WebView(this)
-        setContentView(webView)
+        root.addView(webView, android.widget.FrameLayout.LayoutParams(
+            android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+            android.view.ViewGroup.LayoutParams.MATCH_PARENT
+        ))
+
+        val stopBtn = android.widget.Button(this)
+        stopBtn.text = "Стоп"
+        val lp = android.widget.FrameLayout.LayoutParams(
+            android.view.ViewGroup.LayoutParams.WRAP_CONTENT,
+            android.view.ViewGroup.LayoutParams.WRAP_CONTENT
+        )
+        lp.gravity = android.view.Gravity.BOTTOM or android.view.Gravity.END
+        lp.setMargins(0, 0, 24, 24)
+        stopBtn.layoutParams = lp
+        stopBtn.setOnClickListener { stopEverything() }
+        root.addView(stopBtn)
+
+        setContentView(root)
 
         configureWebView()
 
@@ -38,6 +57,13 @@ class MainActivity : AppCompatActivity() {
             // (карманный режим), как это делает Discord.
             startVoiceService()
         }
+    }
+
+    // Полная остановка: стоп сервиса и закрытие приложения.
+    private fun stopEverything() {
+        Log.d("Govorilka", "Стоп: останавливаю сервис и приложение")
+        stopService(Intent(this, VoiceService::class.java))
+        finishAndRemoveTask()
     }
 
     override fun onRequestPermissionsResult(
