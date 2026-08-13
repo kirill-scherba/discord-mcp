@@ -379,7 +379,10 @@ func govorilkaSignal(w http.ResponseWriter, r *http.Request) {
 		log.Printf("govorilka: pc: %v", err)
 		return
 	}
-	defer pc.Close()
+	// NOTE: pc is NOT closed when the signaling ws closes. The browser closes
+	// the ws after WebRTC connects (it is only needed for the handshake), so
+	// closing pc here would kill the media. pc is closed when the mic track
+	// ends (client leaves) — see OnTrack EOF.
 
 	peer := &govorilkaPeer{pc: pc}
 
@@ -447,6 +450,9 @@ func govorilkaSignal(w http.ResponseWriter, r *http.Request) {
 			rtpPacket, _, err := track.ReadRTP()
 			if err != nil {
 				log.Printf("govorilka: track read: %v", err)
+				// Client left — close the peer connection (it is no longer
+				// tied to the signaling ws, which closed after handshake).
+				pc.Close()
 				return
 			}
 			pktCount++
