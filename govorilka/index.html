@@ -78,7 +78,7 @@ async function refreshMics() {
 }
 refreshBtn.onclick = refreshMics;
 
-connectBtn.onclick = async () => {
+async function connect() {
   try {
     const stream = await ensureMic();
 
@@ -140,7 +140,8 @@ connectBtn.onclick = async () => {
     log('Ошибка подключения: ' + e.message);
     connectBtn.disabled = false;
   }
-};
+}
+connectBtn.onclick = connect;
 
 // reconnect закрывает старое соединение и создаёт новое.
 let reconnectTimer = null;
