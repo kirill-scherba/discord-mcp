@@ -68,36 +68,62 @@ class VoiceService : Service() {
         super.onCreate()
         Log.d("Govorilka", "VoiceService onCreate")
         acquireWakeLock()
-        // Voice-communication audio mode: routes the WebRTC output track to
-        // the speaker when the screen is off / app is backgrounded. Without
-        // MODE_IN_COMMUNICATION, the USAGE_VOICE_COMMUNICATION AudioTrack is
-        // created but stays silent (audio mode stays MODE_NORMAL).
-        val am = getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
-        am.mode = android.media.AudioManager.MODE_IN_COMMUNICATION
-        // Route the voice-communication stream to the loudspeaker (rear
-        // speaker) instead of the earpiece (the one you put to your ear).
-        am.isSpeakerphoneOn = true
-        Log.d("Govorilka", "audio mode: MODE_IN_COMMUNICATION, speakerphone: ${am.isSpeakerphoneOn}")
+        enableBluetoothSco()
         handlerThread = HandlerThread("govorilka-webrtc").apply { start() }
         handler = Handler(handlerThread!!.looper)
         initializeWebRTC()
+    }
+
+    // Enable the Bluetooth voice channel (SCO). Without it, Android routes
+    // the mic and the voice output to the PHONE (earpiece + built-in mic),
+    // not to the BT headset — even when the headset is connected. This is
+    // exactly what Discord/WhatsApp do for calls. Audio returns to normal
+    // in onDestroy (stopBluetoothSco + MODE_NORMAL).
+    private fun enableBluetoothSco() {
+        try {
+            val am = getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
+            am.mode = android.media.AudioManager.MODE_IN_COMMUNICATION
+            am.isBluetoothScoOn = false
+            am.startBluetoothSco()
+            am.isBluetoothScoOn = true
+            Log.d("Govorilka", "BT SCO enabled: mic/output -> headset")
+        } catch (e: Exception) {
+            Log.d("Govorilka", "BT SCO enable error: ${e.message}")
+        }
+    }
+
+    private fun disableBluetoothSco() {
+        try {
+            val am = getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
+            am.isBluetoothScoOn = false
+            am.stopBluetoothSco()
+            am.mode = android.media.AudioManager.MODE_NORMAL
+            Log.d("Govorilka", "BT SCO disabled, mode NORMAL")
+        } catch (e: Exception) {
+            Log.d("Govorilka", "BT SCO disable error: ${e.message}")
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         Log.d("Govorilka", "VoiceService onStartCommand")
         startForegroundCompat()
         connect()
+        startWatchdog()
         return START_STICKY
     }
 
     override fun onDestroy() {
         disconnect()
-        // Restore normal audio mode so the device is not left in the
-        // communication (call) state after the service stops.
-        try {
-            val am = getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
-            am.mode = android.media.AudioManager.MODE_NORMAL
-        } catch (_: Exception) {}
+        disableBluetoothSco()
+        // Release the microphone (AudioSource holds an AudioRecord until
+        // disposed). Done only here, at service teardown — NOT in
+        // disconnect(), which runs on every reconnect.
+        audioSource?.dispose()
+        audioSource = null
+        audioTrack?.dispose()
+        audioTrack = null
+        localStream?.dispose()
+        localStream = null
         handlerThread?.quitSafely()
         wakeLock?.let { if (it.isHeld) it.release() }
         super.onDestroy()
@@ -169,6 +195,13 @@ class VoiceService : Service() {
             }
             override fun onConnectionChange(newState: PeerConnection.PeerConnectionState?) {
                 Log.d("Govorilka", "PC state: $newState")
+                if (newState == PeerConnection.PeerConnectionState.DISCONNECTED ||
+                    newState == PeerConnection.PeerConnectionState.FAILED
+                ) {
+                    scheduleReconnect("pc $newState")
+                } else if (newState == PeerConnection.PeerConnectionState.CONNECTED) {
+                    reconnectAttempts = 0
+                }
             }
         }
         val connection = factory!!.createPeerConnection(rtcConfig, observer) ?: return null
@@ -235,6 +268,7 @@ class VoiceService : Service() {
 
                     override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                         Log.d("Govorilka", "WS closed: $code $reason")
+                        scheduleReconnect("ws closed")
                     }
 
                     override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
@@ -243,6 +277,7 @@ class VoiceService : Service() {
 
                     override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                         Log.d("Govorilka", "WS failure: ${t.message}")
+                        scheduleReconnect("ws failure: ${t.message}")
                     }
                 })
             } catch (e: Exception) {
@@ -294,6 +329,57 @@ class VoiceService : Service() {
         wsHttpClient = null
         pc?.close()
         pc = null
+        // NOTE: audioSource/audioTrack are NOT disposed here — they are
+        // created once in initializeWebRTC() and reused across reconnects
+        // (connect() -> disconnect() runs on every reconnect; disposing here
+        // would NPE on the next addTrack). They are released in onDestroy.
+    }
+
+    // --- Auto-reconnect ---
+    // The service must survive network changes (Wi-Fi -> mobile, tunnel,
+    // server restart). On any WS failure / PC disconnect we tear down and
+    // re-connect with a small backoff. A watchdog re-checks the connection
+    // periodically so a stale-but-open WS (e.g. server vanished) is caught.
+
+    private var reconnectAttempts = 0
+    private var reconnectScheduled = false
+    private var lastConnectedAt = 0L
+
+    private fun scheduleReconnect(reason: String) {
+        if (reconnectScheduled) return
+        reconnectScheduled = true
+        reconnectAttempts++
+        val delay = (3000L * reconnectAttempts).coerceAtMost(15000L)
+        Log.d("Govorilka", "reconnect in ${delay}ms (attempt $reconnectAttempts, $reason)")
+        handler?.postDelayed({
+            reconnectScheduled = false
+            if (pc?.connectionState() != PeerConnection.PeerConnectionState.CONNECTED) {
+                Log.d("Govorilka", "reconnecting...")
+                connect()
+            } else {
+                Log.d("Govorilka", "already connected, skip reconnect")
+            }
+        }, delay)
+    }
+
+    // Periodic watchdog: if the PC is not CONNECTED for a while (server died
+    // without closing the WS, TCP half-open after network switch), force a
+    // reconnect. Runs every 15s.
+    private var watchdogRunning = false
+    private fun startWatchdog() {
+        if (watchdogRunning) return
+        watchdogRunning = true
+        handler?.postDelayed(object : Runnable {
+            override fun run() {
+                val state = pc?.connectionState()
+                val connected = state == PeerConnection.PeerConnectionState.CONNECTED
+                if (!connected) {
+                    Log.d("Govorilka", "watchdog: pc=$state, reconnecting")
+                    connect()
+                }
+                handler?.postDelayed(this, 15000)
+            }
+        }, 15000)
     }
 
     private fun acquireWakeLock() {

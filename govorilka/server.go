@@ -65,12 +65,15 @@ func (p *govorilkaPeer) handleUtterance(pcm []int16) {
 	}
 
 	// Energy gate: background noise (fan, hum) during idle triggers VAD but
-	// produces empty STT — which we pay for. If the utterance is quiet, it is
-	// noise, drop it before sending to Yandex.
-	if voicekit.AvgRMS(pcm) < 400 {
-		log.Printf("govorilka: low-energy utterance skipped (avgRms=%.0f)", voicekit.AvgRMS(pcm))
+	// produces empty STT — which we pay for. If the utterance is quiet or
+	// low-frequency hum (few zero crossings), drop it before sending to
+	// Yandex. Thresholds come from GOV_ENERGY_GATE / GOV_ZCR_MIN env vars.
+	zcr10ms := float64(voicekit.ZeroCrossings(pcm)) * 48000 / float64(len(pcm)) / 100
+	if voicekit.IsNoise(pcm) {
+		log.Printf("govorilka: noise utterance skipped (avgRms=%.0f zcr10ms=%.1f)", voicekit.AvgRMS(pcm), zcr10ms)
 		return
 	}
+	log.Printf("govorilka: utterance passes gate (avgRms=%.0f zcr10ms=%.1f)", voicekit.AvgRMS(pcm), zcr10ms)
 	wav := voicekit.PCMToWAV(pcm)
 	// Save the last utterance for debugging (voice quality check).
 	os.WriteFile("/tmp/govorilka_last.wav", wav, 0o644)
@@ -363,6 +366,8 @@ func startGovorilka() {
 	mux.HandleFunc("/signal", govorilkaSignal)
 	go func() {
 		log.Printf("govorilka: prototype on %s", govorilkaAddr)
+		log.Printf("govorilka: VAD threshold=%.0f energy gate=%.0f zcr min=%.0f (GOV_* env)",
+			voicekit.VADThreshold(), voicekit.EnergyGate(), voicekit.ZCRMin())
 		if err := http.ListenAndServe(govorilkaAddr, mux); err != nil {
 			log.Printf("govorilka: server: %v", err)
 		}
@@ -484,7 +489,7 @@ func govorilkaSignal(w http.ResponseWriter, r *http.Request) {
 				log.Printf("govorilka: pkt decoded=%d rms=%.0f active=%v", decoded, rms, active)
 			}
 			mu.Lock()
-			if rms > 600 {
+			if rms > voicekit.VADThreshold() {
 				pcm = append(pcm, pcmBuf[:decoded]...)
 				if !active {
 					active = true

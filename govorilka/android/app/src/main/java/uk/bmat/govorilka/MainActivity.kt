@@ -3,39 +3,43 @@ package uk.bmat.govorilka
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.util.Log
-import android.webkit.PermissionRequest
-import android.webkit.WebChromeClient
-import android.webkit.WebSettings
-import android.webkit.WebView
-import android.webkit.WebViewClient
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 
 class MainActivity : AppCompatActivity() {
 
-    private lateinit var webView: WebView
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // WebView + плавающая кнопка «Стоп» поверх.
+        // Fresh activity = fresh start: allow the service to (re)start even
+        // if the process survived a previous stopEverything().
+        serviceStarted = false
+
+        // IMPORTANT: no WebView. The web page (govorilka.bmat.uk) is a full
+        // WebRTC client itself — loading it here would start a SECOND
+        // PeerConnection, a second microphone capture and a second audio
+        // output, fighting the native VoiceService over mic/audio routing.
+        // All audio goes through the native service only.
         val root = android.widget.FrameLayout(this)
-        webView = WebView(this)
-        root.addView(webView, android.widget.FrameLayout.LayoutParams(
+
+        val title = android.widget.TextView(this)
+        title.text = "Говорилка (нативный режим)"
+        title.textSize = 20f
+        title.gravity = android.view.Gravity.CENTER
+        root.addView(title, android.widget.FrameLayout.LayoutParams(
             android.view.ViewGroup.LayoutParams.MATCH_PARENT,
-            android.view.ViewGroup.LayoutParams.MATCH_PARENT
-        ))
+            android.view.ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { gravity = android.view.Gravity.CENTER })
 
         val stopBtn = android.widget.Button(this)
         stopBtn.text = "Стоп"
         val lp = android.widget.FrameLayout.LayoutParams(
-            android.view.ViewGroup.LayoutParams.WRAP_CONTENT,
-            android.view.ViewGroup.LayoutParams.WRAP_CONTENT
+            android.widget.FrameLayout.LayoutParams.WRAP_CONTENT,
+            android.widget.FrameLayout.LayoutParams.WRAP_CONTENT
         )
         lp.gravity = android.view.Gravity.BOTTOM or android.view.Gravity.END
         lp.setMargins(0, 0, 24, 24)
@@ -45,9 +49,7 @@ class MainActivity : AppCompatActivity() {
 
         setContentView(root)
 
-        configureWebView()
-
-        // Микрофон нужен до загрузки страницы (WebRTC).
+        // Микрофон нужен для нативного WebRTC (VoiceService).
         // FOREGROUND_SERVICE_MICROPHONE — normal-разрешение (в манифесте),
         // его НЕ запрашивают runtime. Запрашиваем только RECORD_AUDIO,
         // иначе requestPermissions с несуществующим разрешением виснет и
@@ -67,6 +69,11 @@ class MainActivity : AppCompatActivity() {
     private fun stopEverything() {
         Log.d("Govorilka", "Стоп: останавливаю сервис и приложение")
         stopService(Intent(this, VoiceService::class.java))
+        // Reset the guard: the process may survive finishAndRemoveTask(),
+        // and serviceStarted is a static that lives as long as the process.
+        // Without the reset, the next launch would skip startVoiceService()
+        // and the app would do nothing.
+        serviceStarted = false
         finishAndRemoveTask()
     }
 
@@ -79,28 +86,8 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun configureWebView() {
-        val settings = webView.settings
-        settings.javaScriptEnabled = true
-        settings.mediaPlaybackRequiresUserGesture = false
-        settings.domStorageEnabled = true
-        settings.setSupportZoom(false)
-
-        // Разрешить getUserMedia (микрофон) внутри WebView.
-        webView.webChromeClient = object : WebChromeClient() {
-            override fun onPermissionRequest(request: PermissionRequest) {
-                // WebRTC: grant mic (camera не нужна).
-                request.grant(request.resources)
-            }
-        }
-        webView.webViewClient = WebViewClient()
-
-        // URL говорилки — https (микрофон работает только в secure context).
-        webView.loadUrl(GOVORILKA_URL)
-    }
-
     override fun onBackPressed() {
-        if (webView.canGoBack()) webView.goBack() else super.onBackPressed()
+        super.onBackPressed()
     }
 
     // --- Diagnostics: lifecycle logging to see what happens in background ---
@@ -116,7 +103,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
-        Log.d("Govorilka", "onResume: приложение снова активно, url=${webView.url}")
+        Log.d("Govorilka", "onResume: приложение снова активно")
     }
 
     override fun onDestroy() {
@@ -139,7 +126,5 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         private var serviceStarted = false
-        // Временный URL — пока WebRTC-сервер на нашем домене.
-        private const val GOVORILKA_URL = "https://govorilka.bmat.uk"
     }
 }
