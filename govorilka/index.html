@@ -29,11 +29,30 @@ const refreshBtn = document.getElementById('refreshmics');
 
 let pc = null;
 let ws = null;
+let micStream = null;
 
 function log(msg) { statusEl.textContent += msg + '\n'; }
 
 function signal(type, data) {
   ws.send(JSON.stringify({ signal: type, data }));
+}
+
+// ensureMic gets the microphone once; reused across reconnects.
+async function ensureMic() {
+  if (micStream) return micStream;
+  log('Запрашиваю микрофон...');
+  const audioConstraints = {
+    echoCancellation: true,
+    noiseSuppression: true,
+    autoGainControl: false
+  };
+  const micId = micSelect.value;
+  if (micId) {
+    audioConstraints.deviceId = { exact: micId };
+    localStorage.setItem('govorilka_mic', micId);
+  }
+  micStream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints });
+  return micStream;
 }
 
 // List microphones so the user picks the right one (browser default may be
@@ -60,24 +79,14 @@ async function refreshMics() {
 refreshBtn.onclick = refreshMics;
 
 connectBtn.onclick = async () => {
-  log('Запрашиваю микрофон...');
-  const audioConstraints = {
-    echoCancellation: true,
-    noiseSuppression: true,
-    autoGainControl: false
-  };
-  const micId = micSelect.value;
-  if (micId) {
-    audioConstraints.deviceId = { exact: micId };
-    localStorage.setItem('govorilka_mic', micId);
-  }
-  const stream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints });
+  try {
+    const stream = await ensureMic();
 
-  log('Создаю WebRTC...');
-  pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+    log('Создаю WebRTC...');
+    pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
 
-  // Микрофон → аудио-трек на сервер
-  stream.getAudioTracks().forEach(t => pc.addTrack(t, stream));
+    // Микрофон → аудио-трек на сервер
+    stream.getAudioTracks().forEach(t => pc.addTrack(t, stream));
 
   // Ответ сервера (TTS-речь) → плеер. Один audio-элемент на всё
   // соединение: пересоздание в каждом ontrack ломает autoplay в Chrome.
@@ -94,7 +103,14 @@ connectBtn.onclick = async () => {
   replyAudio.onerror = (e) => log('Audio error: ' + (e.target.error ? e.target.error.message : 'unknown'));
 
   pc.onicecandidate = (ev) => { if (ev.candidate) signal('candidate', ev.candidate.toJSON()); };
-  pc.onconnectionstatechange = () => log('Состояние: ' + pc.connectionState);
+  pc.onconnectionstatechange = () => {
+    log('Состояние: ' + pc.connectionState);
+    // Автопереподключение при обрыве: disconnected/failed → пересоздать.
+    if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') {
+      log('Соединение потеряно, переподключаюсь...');
+      setTimeout(() => reconnect(), 1500);
+    }
+  };
 
   // Сигналинг по WebSocket
   ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/signal');
@@ -113,10 +129,41 @@ connectBtn.onclick = async () => {
       await pc.addIceCandidate(msg.data);
     }
   };
+  ws.onclose = () => {
+    log('Сигналинг закрыт, переподключаюсь...');
+    if (connectBtn.disabled) setTimeout(() => reconnect(), 1500);
+  };
 
   connectBtn.disabled = true;
   disconnectBtn.disabled = false;
+  } catch (e) {
+    log('Ошибка подключения: ' + e.message);
+    connectBtn.disabled = false;
+  }
 };
+
+// reconnect закрывает старое соединение и создаёт новое.
+let reconnectTimer = null;
+async function reconnect() {
+  if (reconnectTimer) return;          // уже переподключаемся
+  if (!connectBtn.disabled) return;    // соединение не активно (отключены вручную)
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+  }, 3000);
+
+  log('Reconnect: закрываю старое соединение...');
+  if (pc) { pc.onconnectionstatechange = null; pc.close(); pc = null; }
+  if (ws) { ws.onclose = null; ws.close(); ws = null; }
+
+  // Пересоздаём соединение (микрофон уже запрошен ранее).
+  try {
+    await connect();
+    log('Reconnect: соединение восстановлено.');
+  } catch (e) {
+    log('Reconnect: ошибка — ' + e.message + '. Повторю через 3 сек.');
+    setTimeout(() => { reconnectTimer = null; reconnect(); }, 3000);
+  }
+}
 
 disconnectBtn.onclick = () => {
   if (pc) pc.close();
