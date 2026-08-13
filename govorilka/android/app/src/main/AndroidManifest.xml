@@ -31,7 +31,9 @@
             </intent-filter>
         </activity>
 
-        <!-- VoiceService (pocket mode) temporarily removed to isolate the
-             crash; will be re-added once the WebView part works. -->
+        <service
+            android:name=".VoiceService"
+            android:exported="false"
+            android:foregroundServiceType="microphone" />
     </application>
 </manifest>
