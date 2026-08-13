@@ -63,6 +63,14 @@ func (p *govorilkaPeer) handleUtterance(pcm []int16) {
 	if len(pcm) < 48000/4 { // ignore sub-250ms blips
 		return
 	}
+
+	// Energy gate: background noise (fan, hum) during idle triggers VAD but
+	// produces empty STT — which we pay for. If the utterance is quiet, it is
+	// noise, drop it before sending to Yandex.
+	if voicekit.AvgRMS(pcm) < 400 {
+		log.Printf("govorilka: low-energy utterance skipped (avgRms=%.0f)", voicekit.AvgRMS(pcm))
+		return
+	}
 	wav := voicekit.PCMToWAV(pcm)
 	// Save the last utterance for debugging (voice quality check).
 	os.WriteFile("/tmp/govorilka_last.wav", wav, 0o644)
@@ -476,7 +484,7 @@ func govorilkaSignal(w http.ResponseWriter, r *http.Request) {
 				log.Printf("govorilka: pkt decoded=%d rms=%.0f active=%v", decoded, rms, active)
 			}
 			mu.Lock()
-			if rms > 300 {
+			if rms > 600 {
 				pcm = append(pcm, pcmBuf[:decoded]...)
 				if !active {
 					active = true
