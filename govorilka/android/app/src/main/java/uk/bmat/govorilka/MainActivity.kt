@@ -48,17 +48,14 @@ class MainActivity : AppCompatActivity() {
         configureWebView()
 
         // Микрофон нужен до загрузки страницы (WebRTC).
-        // На Android 14+ нужно runtime-разрешение FOREGROUND_SERVICE_MICROPHONE,
-        // иначе startForegroundService с типом microphone не запустится.
-        val perms = mutableListOf(Manifest.permission.RECORD_AUDIO)
-        if (Build.VERSION.SDK_INT >= 34) {
-            perms.add("android.permission.FOREGROUND_SERVICE_MICROPHONE")
-        }
-        val missing = perms.filter {
-            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
-        }
-        if (missing.isNotEmpty()) {
-            ActivityCompat.requestPermissions(this, missing.toTypedArray(), 1)
+        // FOREGROUND_SERVICE_MICROPHONE — normal-разрешение (в манифесте),
+        // его НЕ запрашивают runtime. Запрашиваем только RECORD_AUDIO,
+        // иначе requestPermissions с несуществующим разрешением виснет и
+        // onRequestPermissionsResult не приходит → сервис не стартует.
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.RECORD_AUDIO), 1)
         } else {
             // VoiceService: foreground + WakeLock — держит приложение в фоне
             // (карманный режим), как это делает Discord.
