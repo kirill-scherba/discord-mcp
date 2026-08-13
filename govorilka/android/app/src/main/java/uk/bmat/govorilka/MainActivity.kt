@@ -32,18 +32,16 @@ class MainActivity : AppCompatActivity() {
             != PackageManager.PERMISSION_GRANTED
         ) {
             ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.RECORD_AUDIO), 1)
-        } else {
-            startVoiceService()
         }
+        // NOTE: VoiceService (pocket mode) temporarily disabled to isolate
+        // the crash. Will be re-enabled once the WebView part works.
     }
 
     override fun onRequestPermissionsResult(
         requestCode: Int, permissions: Array<out String>, grantResults: IntArray
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-            startVoiceService()
-        }
+        // VoiceService disabled for now; page loads regardless.
     }
 
     private fun configureWebView() {
