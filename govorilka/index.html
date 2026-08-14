@@ -180,6 +180,34 @@ disconnectBtn.onclick = () => {
   disconnectBtn.disabled = true;
   log('Отключено.');
 };
+
+// Watchdog: WebRTC often stays in "connected" state on a dead channel
+// (server restart) — ICE keepalive takes a long time to notice, so
+// onconnectionstatechange may never fire. Every 5s check whether the
+// connection is actually alive; if not (or stuck in connecting for a
+// while), reconnect.
+let stuckSince = 0;
+setInterval(() => {
+  if (!pc || !disconnectBtn.disabled) return; // not connected
+  const st = pc.connectionState;
+  if (st === 'disconnected' || st === 'failed') {
+    if (reconnectTimer) return;
+    log('Watchdog: соединение ' + st + ', переподключаюсь...');
+    reconnect();
+  } else if (st === 'connecting') {
+    // Only force if connecting takes too long (>=10s) — a fresh connect
+    // legitimately spends a couple seconds in connecting.
+    if (stuckSince === 0) stuckSince = Date.now();
+    if (Date.now() - stuckSince > 10000) {
+      stuckSince = 0;
+      if (reconnectTimer) return;
+      log('Watchdog: connecting слишком долго, переподключаюсь...');
+      reconnect();
+    }
+  } else {
+    stuckSince = 0; // connected / new — reset the timer
+  }
+}, 5000);
 </script>
 </body>
 </html>

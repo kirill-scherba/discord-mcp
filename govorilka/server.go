@@ -49,9 +49,18 @@ type govorilkaPeer struct {
 	ts  uint32
 
 	// Voice commands state (mirrors the Discord bot):
-	muted     bool
 	lastReply string
 	interrupt bool
+
+	// Wake-word (sleep/wake) state: the peer starts ASLEEP and only runs
+	// the STT -> brain -> TTS pipeline after "Барон" is detected. An
+	// inactivity timeout returns it to sleep, saving Yandex STT money.
+	// The detector is the local Vosk recognizer (real speech recognition,
+	// no false positives on similar-sounding phrases).
+	wake        *voicekit.WakeVosk
+	sleeping    bool
+	wakeMu      sync.Mutex
+	lastActive  time.Time
 }
 
 // handleUtterance runs the voice pipeline for one utterance and sends the
@@ -63,7 +72,6 @@ func (p *govorilkaPeer) handleUtterance(pcm []int16) {
 	if len(pcm) < 48000/4 { // ignore sub-250ms blips
 		return
 	}
-
 	// Energy gate: background noise (fan, hum) during idle triggers VAD but
 	// produces empty STT — which we pay for. If the utterance is quiet or
 	// low-frequency hum (few zero crossings), drop it before sending to
@@ -85,8 +93,32 @@ func (p *govorilkaPeer) handleUtterance(pcm []int16) {
 	text = voicekit.TrimWhitespace(text)
 	if text == "" {
 		log.Printf("govorilka: STT empty (noise), %dms audio", len(pcm)/48)
+		// Fast sleep: continuous noise (passed the energy gate but not
+		// speech) — if no real speech was heard for > 5s, go back to sleep
+		// right away instead of waiting for the full inactivity timeout.
+		p.wakeMu.Lock()
+		if !p.sleeping && p.wake != nil &&
+			time.Since(p.lastActive) > 5*time.Second {
+			p.sleeping = true
+			// Vosk resets itself after each utterance
+			p.wakeMu.Unlock()
+			log.Printf("govorilka: noise for 5s -> sleeping (say %q to wake)", "Барон")
+			// Sleep signal: two low beeps ("тук-тук").
+			go func() {
+				p.playClick(600, 16000)
+				time.Sleep(120 * time.Millisecond)
+				p.playClick(600, 16000)
+			}()
+			return
+		}
+		p.wakeMu.Unlock()
 		return
 	}
+	// Only REAL recognized speech extends the active window — noise that
+	// passed the energy gate (loud hum, music) must NOT delay sleep.
+	p.wakeMu.Lock()
+	p.lastActive = time.Now()
+	p.wakeMu.Unlock()
 	log.Printf("govorilka: heard: %q", text)
 
 	// Voice commands handled locally (mirror the Discord bot):
@@ -99,46 +131,34 @@ func (p *govorilkaPeer) handleUtterance(pcm []int16) {
 		p.interrupt = true
 		p.mu.Unlock()
 		return
-	// "продолжаем" and "повтори" work even while muted.
-	case "продолжаем":
-		p.mu.Lock()
-		p.muted = false
-		p.interrupt = true
-		p.mu.Unlock()
-		log.Printf("govorilka: muted OFF")
-		p.speakReply("Продолжаем.")
-		return
 	case "повтори":
 		p.mu.Lock()
 		last := p.lastReply
-		p.muted = false
-		p.interrupt = true
 		p.mu.Unlock()
-		log.Printf("govorilka: muted OFF (повтори)")
+		log.Printf("govorilka: повтори")
 		if last == "" {
 			p.speakReply("Мне пока нечего повторить.")
 		} else {
 			p.speakReply(last)
 		}
 		return
-	}
-
-	// While muted, ignore everything else.
-	p.mu.Lock()
-	muted := p.muted
-	p.mu.Unlock()
-	if muted {
-		log.Printf("govorilka: muted, ignoring: %q", text)
-		return
-	}
-
-	if cmd == "молчи" {
-		p.mu.Lock()
-		p.muted = true
-		p.interrupt = true
-		p.mu.Unlock()
-		log.Printf("govorilka: muted ON")
-		p.speakReply("Молчу.")
+	// "молчи" goes to sleep: stop listening, wake up with "Барон".
+	case "молчи":
+		p.wakeMu.Lock()
+		if p.wake != nil {
+			p.sleeping = true
+			// Vosk resets itself after each utterance
+			p.wakeMu.Unlock()
+			log.Printf("govorilka: молчи -> sleeping (say %q to wake)", "Барон")
+			// Sleep signal: two low beeps ("тук-тук").
+			go func() {
+				p.playClick(600, 16000)
+				time.Sleep(120 * time.Millisecond)
+				p.playClick(600, 16000)
+			}()
+		} else {
+			p.wakeMu.Unlock()
+		}
 		return
 	}
 
@@ -399,6 +419,18 @@ func govorilkaSignal(w http.ResponseWriter, r *http.Request) {
 
 	peer := &govorilkaPeer{pc: pc}
 
+	// Wake-word detector: the peer starts asleep and waits for "Барон",
+	// recognized by the local Vosk speech recognizer (real STT, no false
+	// positives). If Vosk cannot start the peer stays awake (old behaviour).
+	if det, err := voicekit.NewWakeVosk("Барон"); err == nil {
+		peer.wake = det
+		peer.sleeping = true
+		log.Printf("govorilka: wake-word mode ON (vosk), timeout=%ds",
+			voicekit.WakeTimeoutSec())
+	} else {
+		log.Printf("govorilka: wake-word disabled (%v), always listening", err)
+	}
+
 	// Output track carries the synthesized reply back to the browser.
 	// The earlier acoustic loop was caused by HTML auto-playing the received
 	// stream (srcObject = own mic); that was removed, so the track is safe.
@@ -427,6 +459,12 @@ func govorilkaSignal(w http.ResponseWriter, r *http.Request) {
 		var pcm []int16
 		active := false
 		pcmBuf := make([]int16, 960)
+		// Pre-roll ring buffer: keep the last ~300ms of audio so that when
+		// speech starts (VAD trip) the beginning of the first word is not
+		// lost. Without it, "Барон" said from silence is captured as "-арон"
+		// and the wake detector misses it; "Привет Барон" works because the
+		// VAD is already active when "Барон" begins.
+		preRoll := make([]int16, 0, 480*6)
 		var mu sync.Mutex
 		pktCount := 0
 
@@ -451,11 +489,43 @@ func govorilkaSignal(w http.ResponseWriter, r *http.Request) {
 					active = false
 					mu.Unlock()
 					log.Printf("govorilka: timer fired, utterance %d samples", len(utterance))
-					go peer.handleUtterance(utterance)
+					// While asleep, feed the utterance to the wake-word
+					// detector instead of running STT.
+					peer.wakeMu.Lock()
+					sleeping := peer.sleeping
+					wake := peer.wake
+					peer.wakeMu.Unlock()
+					if sleeping && wake != nil {
+						// Vosk listens continuously in the main RTP loop;
+						// nothing to do here for sleep mode.
+					} else {
+						go peer.handleUtterance(utterance)
+					}
 				} else {
 					mu.Unlock()
 				}
 				timer.Reset(time.Hour)
+			}
+		}()
+
+		// Sleep watchdog: return to sleep after inactivity (no utterances
+		// for GOV_WAKE_TIMEOUT seconds while listening).
+		go func() {
+			for {
+				time.Sleep(5 * time.Second)
+				peer.wakeMu.Lock()
+				if !peer.sleeping && peer.wake != nil {
+					if time.Since(peer.lastActive) > time.Duration(voicekit.WakeTimeoutSec())*time.Second {
+						peer.sleeping = true
+						// Vosk resets itself after each utterance
+						peer.wakeMu.Unlock()
+						log.Printf("govorilka: idle timeout -> sleeping (say %q to wake)", "Барон")
+						// Sleep signal: one low beep.
+						go peer.playClick(600, 16000)
+						continue
+					}
+				}
+				peer.wakeMu.Unlock()
 			}
 		}()
 
@@ -488,18 +558,50 @@ func govorilkaSignal(w http.ResponseWriter, r *http.Request) {
 			if pktCount%50 == 1 || rms < 5000 {
 				log.Printf("govorilka: pkt decoded=%d rms=%.0f active=%v", decoded, rms, active)
 			}
+			// While asleep, feed every decoded frame to the Vosk wake-word
+			// recognizer (it listens continuously in the stream).
+			peer.wakeMu.Lock()
+			sleeping := peer.sleeping
+			wake := peer.wake
+			peer.wakeMu.Unlock()
+			if sleeping && wake != nil {
+				if wake.Feed(pcmBuf[:decoded]) {
+					peer.wakeMu.Lock()
+					peer.sleeping = false
+					peer.lastActive = time.Now()
+					peer.wakeMu.Unlock()
+					log.Printf("govorilka: wake word detected -> listening")
+					// Awake signal: two quick high beeps.
+					go func() {
+						peer.playClick(1200, 16000)
+						time.Sleep(120 * time.Millisecond)
+						peer.playClick(1800, 16000)
+					}()
+				}
+				continue
+			}
 			mu.Lock()
 			if rms > voicekit.VADThreshold() {
-				pcm = append(pcm, pcmBuf[:decoded]...)
+				// Speech starts: prepend the pre-roll (recent quiet audio)
+				// so the onset of the first word is captured.
 				if !active {
+					pcm = append(pcm, preRoll...)
+					preRoll = preRoll[:0]
 					active = true
 				}
+				pcm = append(pcm, pcmBuf[:decoded]...)
 				// Reset the end-of-utterance timer only on speech, not on
 				// silence packets — otherwise continuous silence keeps
 				// restarting the 500ms timer forever.
 				timer.Reset(500 * time.Millisecond)
 			} else if active {
 				pcm = append(pcm, pcmBuf[:decoded]...)
+			} else {
+				// Idle: keep the rolling pre-roll buffer (last ~300ms).
+				preRoll = append(preRoll, pcmBuf[:decoded]...)
+				if len(preRoll) > 480*6 {
+					preRoll = append([]int16(nil), preRoll[len(preRoll)-480*6:]...)
+				}
 			}
 			mu.Unlock()
 		}

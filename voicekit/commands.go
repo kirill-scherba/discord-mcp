@@ -7,11 +7,13 @@ import "strings"
 // "повтори ещё раз". Long phrases that merely contain a command word
 // ("молчи и слушай...") are NOT commands — they are ordinary speech.
 // Root-substring matching tolerates STT noise ("молчу" vs "молчи").
-// Commands:
-//   - "молчи" (mute): "молчи", "замолчи"
+// Commands (Govorilka wake-word world):
+//   - "молчи" (sleep): "молчи", "замолчи" — stop listening, go to sleep
+//     (wake up again with "Барон")
 //   - "стоп" (interrupt only): "остановись", "хватит"
-//   - "продолжаем" (un-mute)
 //   - "повтори" (replay last reply)
+// NOTE: "продолжаем" was removed — there is no mute/un-mute anymore;
+// you wake the peer with the wake word instead.
 func MatchCommand(text string) string {
 	t := strings.ToLower(strings.TrimSpace(text))
 	if t == "" {
@@ -26,8 +28,6 @@ func MatchCommand(text string) string {
 		return "стоп"
 	case strings.Contains(t, "молч"):
 		return "молчи"
-	case strings.Contains(t, "продолж"):
-		return "продолжаем"
 	case strings.Contains(t, "повтор"):
 		return "повтори"
 	}
