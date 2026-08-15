@@ -1,16 +1,25 @@
 package uk.bmat.govorilka
 
 import android.Manifest
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.util.Log
+import android.view.Gravity
+import android.widget.EditText
+import android.widget.FrameLayout
+import android.widget.LinearLayout
+import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 
 class MainActivity : AppCompatActivity() {
+
+    private lateinit var loginInput: EditText
+    private lateinit var passInput: EditText
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -24,28 +33,79 @@ class MainActivity : AppCompatActivity() {
         // PeerConnection, a second microphone capture and a second audio
         // output, fighting the native VoiceService over mic/audio routing.
         // All audio goes through the native service only.
-        val root = android.widget.FrameLayout(this)
+        val root = FrameLayout(this)
 
-        val title = android.widget.TextView(this)
+        // Column: title, login/password fields, connect button.
+        val column = LinearLayout(this)
+        column.orientation = LinearLayout.VERTICAL
+        column.setPadding(48, 48, 48, 48)
+        root.addView(column, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT,
+            FrameLayout.LayoutParams.WRAP_CONTENT
+        ).apply { gravity = Gravity.CENTER })
+
+        val title = TextView(this)
         title.text = "Говорилка (нативный режим)"
-        title.textSize = 20f
-        title.gravity = android.view.Gravity.CENTER
-        root.addView(title, android.widget.FrameLayout.LayoutParams(
-            android.view.ViewGroup.LayoutParams.MATCH_PARENT,
-            android.view.ViewGroup.LayoutParams.WRAP_CONTENT
-        ).apply { gravity = android.view.Gravity.CENTER })
+        title.textSize = 22f
+        title.gravity = Gravity.CENTER
+        column.addView(title)
+
+        loginInput = EditText(this)
+        loginInput.hint = "Логин"
+        loginInput.setText(savedLogin())
+        column.addView(loginInput)
+
+        passInput = EditText(this)
+        passInput.hint = "Пароль"
+        passInput.inputType = android.text.InputType.TYPE_CLASS_TEXT or
+            android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
+        passInput.setText(savedPass())
+        column.addView(passInput)
+
+        // Audio route selector (like the speaker button in call apps).
+        val routeLabel = TextView(this)
+        routeLabel.text = "Звук:"
+        routeLabel.textSize = 16f
+        column.addView(routeLabel)
+
+        val routeGroup = android.widget.RadioGroup(this)
+        routeGroup.orientation = android.widget.RadioGroup.VERTICAL
+        val routes = arrayOf(
+            "auto" to "Авто (наушники, если подключены)",
+            "phone" to "Телефон (разговорный)",
+            "speaker" to "Громкая связь",
+            "bt" to "Блютус"
+        )
+        val savedRoute = savedRoute()
+        var nextId = 1000
+        for ((key, label) in routes) {
+            val rb = android.widget.RadioButton(this)
+            rb.id = nextId++
+            rb.text = label
+            rb.tag = key
+            rb.isChecked = (key == savedRoute)
+            routeGroup.addView(rb)
+        }
+        routeGroup.setOnCheckedChangeListener { _, checkedId ->
+            val rb = routeGroup.findViewById<android.widget.RadioButton>(checkedId)
+            val key = rb?.tag as? String ?: "auto"
+            getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .edit().putString("route", key).apply()
+            Log.d("Govorilka", "audio route set: $key")
+            // Apply immediately to the running service (no restart needed).
+            VoiceService.applyRouteImmediate(this)
+        }
+        column.addView(routeGroup)
+
+        val connectBtn = android.widget.Button(this)
+        connectBtn.text = "Подключиться"
+        connectBtn.setOnClickListener { saveAndConnect() }
+        column.addView(connectBtn)
 
         val stopBtn = android.widget.Button(this)
         stopBtn.text = "Стоп"
-        val lp = android.widget.FrameLayout.LayoutParams(
-            android.widget.FrameLayout.LayoutParams.WRAP_CONTENT,
-            android.widget.FrameLayout.LayoutParams.WRAP_CONTENT
-        )
-        lp.gravity = android.view.Gravity.BOTTOM or android.view.Gravity.END
-        lp.setMargins(0, 0, 24, 24)
-        stopBtn.layoutParams = lp
         stopBtn.setOnClickListener { stopEverything() }
-        root.addView(stopBtn)
+        column.addView(stopBtn)
 
         setContentView(root)
 
@@ -59,11 +119,39 @@ class MainActivity : AppCompatActivity() {
         ) {
             ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.RECORD_AUDIO), 1)
         } else {
-            // VoiceService: foreground + WakeLock — держит приложение в фоне
-            // (карманный режим), как это делает Discord.
-            startVoiceService()
+            // If credentials are already saved, start immediately (pocket
+            // mode). Otherwise the user enters them first.
+            if (savedLogin().isNotEmpty() && savedPass().isNotEmpty()) {
+                startVoiceService()
+            }
         }
     }
+
+    // Save credentials and start the service (pocket mode).
+    private fun saveAndConnect() {
+        val login = loginInput.text.toString().trim()
+        val pass = passInput.text.toString()
+        if (login.isEmpty() || pass.isEmpty()) {
+            Log.d("Govorilka", "креды не заполнены")
+            return
+        }
+        getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .edit()
+            .putString("login", login)
+            .putString("pass", pass)
+            .apply()
+        Log.d("Govorilka", "креды сохранены, подключаюсь")
+        startVoiceService()
+    }
+
+    private fun savedLogin(): String =
+        getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString("login", "") ?: ""
+
+    private fun savedPass(): String =
+        getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString("pass", "") ?: ""
+
+    private fun savedRoute(): String =
+        getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString("route", "auto") ?: "auto"
 
     // Полная остановка: стоп сервиса и закрытие приложения.
     private fun stopEverything() {
@@ -82,7 +170,9 @@ class MainActivity : AppCompatActivity() {
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-            startVoiceService()
+            if (savedLogin().isNotEmpty() && savedPass().isNotEmpty()) {
+                startVoiceService()
+            }
         }
     }
 
@@ -125,6 +215,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     companion object {
+        private const val PREFS = "govorilka_prefs"
         private var serviceStarted = false
     }
 }

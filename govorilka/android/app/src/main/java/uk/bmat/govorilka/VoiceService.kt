@@ -68,27 +68,56 @@ class VoiceService : Service() {
         super.onCreate()
         Log.d("Govorilka", "VoiceService onCreate")
         acquireWakeLock()
-        enableBluetoothSco()
+        // Apply the audio route chosen in MainActivity (auto/phone/speaker/bt).
+        applyAudioRoute()
         handlerThread = HandlerThread("govorilka-webrtc").apply { start() }
         handler = Handler(handlerThread!!.looper)
         initializeWebRTC()
     }
 
-    // Enable the Bluetooth voice channel (SCO). Without it, Android routes
-    // the mic and the voice output to the PHONE (earpiece + built-in mic),
-    // not to the BT headset — even when the headset is connected. This is
-    // exactly what Discord/WhatsApp do for calls. Audio returns to normal
-    // in onDestroy (stopBluetoothSco + MODE_NORMAL).
-    private fun enableBluetoothSco() {
+    // Audio route selector — like the speaker button in call apps.
+    //   "auto"   — follow the connected headset (default; BT SCO when a
+    //              headset is connected, otherwise the phone speaker)
+    //   "phone"  — earpiece + phone mic, BT disabled
+    //   "speaker"— loudspeaker + phone mic (громкая связь)
+    //   "bt"     — Bluetooth SCO headset (mic + audio via BT)
+    private fun applyAudioRoute() {
         try {
             val am = getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
+            val prefs = getSharedPreferences("govorilka_prefs", Context.MODE_PRIVATE)
+            val route = prefs.getString("route", "auto") ?: "auto"
             am.mode = android.media.AudioManager.MODE_IN_COMMUNICATION
-            am.isBluetoothScoOn = false
-            am.startBluetoothSco()
-            am.isBluetoothScoOn = true
-            Log.d("Govorilka", "BT SCO enabled: mic/output -> headset")
+
+            when (route) {
+                "phone" -> {
+                    am.isBluetoothScoOn = false
+                    am.stopBluetoothSco()
+                    am.isSpeakerphoneOn = false
+                    Log.d("Govorilka", "audio route: phone (earpiece)")
+                }
+                "speaker" -> {
+                    am.isBluetoothScoOn = false
+                    am.stopBluetoothSco()
+                    am.isSpeakerphoneOn = true
+                    Log.d("Govorilka", "audio route: speaker (громкая связь)")
+                }
+                "bt" -> {
+                    am.isSpeakerphoneOn = false
+                    am.isBluetoothScoOn = false
+                    am.startBluetoothSco()
+                    am.isBluetoothScoOn = true
+                    Log.d("Govorilka", "audio route: bluetooth SCO")
+                }
+                else -> { // auto: follow the headset (old behaviour)
+                    am.isSpeakerphoneOn = false
+                    am.isBluetoothScoOn = false
+                    am.startBluetoothSco()
+                    am.isBluetoothScoOn = true
+                    Log.d("Govorilka", "audio route: auto (BT if connected)")
+                }
+            }
         } catch (e: Exception) {
-            Log.d("Govorilka", "BT SCO enable error: ${e.message}")
+            Log.d("Govorilka", "audio route error: ${e.message}")
         }
     }
 
@@ -220,9 +249,20 @@ class VoiceService : Service() {
                     .pingInterval(30, java.util.concurrent.TimeUnit.SECONDS)
                     .build()
                 wsHttpClient = client
-                val request = Request.Builder()
+                // Basic auth credentials (same as the private gallery):
+                // entered once in MainActivity, stored in SharedPreferences.
+                val prefs = getSharedPreferences("govorilka_prefs", Context.MODE_PRIVATE)
+                val login = prefs.getString("login", "") ?: ""
+                val pass = prefs.getString("pass", "") ?: ""
+                var reqBuilder = Request.Builder()
                     .url("wss://govorilka.bmat.uk/signal")
-                    .build()
+                if (login.isNotEmpty() && pass.isNotEmpty()) {
+                    val cred = java.util.Base64.getEncoder()
+                        .encodeToString("$login:$pass".toByteArray(Charsets.UTF_8))
+                    reqBuilder = reqBuilder.header("Authorization", "Basic $cred")
+                    Log.d("Govorilka", "WS auth: user=$login")
+                }
+                val request = reqBuilder.build()
                 ws = client.newWebSocket(request, object : WebSocketListener() {
                     override fun onOpen(webSocket: WebSocket, response: Response) {
                         Log.d("Govorilka", "WS open, sending offer")
@@ -424,6 +464,52 @@ class VoiceService : Service() {
             startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
         } else {
             startForeground(1, notification)
+        }
+    }
+
+    companion object {
+        @Volatile
+        private var appContext: Context? = null
+
+        // Called from MainActivity when the user switches the audio route:
+        // applies the new route to the running service WITHOUT restarting
+        // WebRTC — Android re-routes the AudioTrack output live.
+        fun applyRouteImmediate(context: Context) {
+            appContext = context.applicationContext
+            val ctx = appContext ?: return
+            try {
+                val am = ctx.getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
+                val prefs = ctx.getSharedPreferences("govorilka_prefs", Context.MODE_PRIVATE)
+                val route = prefs.getString("route", "auto") ?: "auto"
+                am.mode = android.media.AudioManager.MODE_IN_COMMUNICATION
+                when (route) {
+                    "phone" -> {
+                        am.isBluetoothScoOn = false
+                        am.stopBluetoothSco()
+                        am.isSpeakerphoneOn = false
+                    }
+                    "speaker" -> {
+                        am.isBluetoothScoOn = false
+                        am.stopBluetoothSco()
+                        am.isSpeakerphoneOn = true
+                    }
+                    "bt" -> {
+                        am.isSpeakerphoneOn = false
+                        am.isBluetoothScoOn = false
+                        am.startBluetoothSco()
+                        am.isBluetoothScoOn = true
+                    }
+                    else -> {
+                        am.isSpeakerphoneOn = false
+                        am.isBluetoothScoOn = false
+                        am.startBluetoothSco()
+                        am.isBluetoothScoOn = true
+                    }
+                }
+                Log.d("Govorilka", "audio route changed live: $route")
+            } catch (e: Exception) {
+                Log.d("Govorilka", "audio route live error: ${e.message}")
+            }
         }
     }
 }
