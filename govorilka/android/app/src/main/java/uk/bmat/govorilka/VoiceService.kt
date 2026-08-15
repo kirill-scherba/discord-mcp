@@ -421,11 +421,15 @@ class VoiceService : Service() {
             val obj = org.json.JSONObject(msg)
             when (obj.optString("state")) {
                 "sleep" -> {
+                    // Mute immediately: the server is asleep and not
+                    // listening, so any audio sent now is wasted traffic.
+                    // The local Vosk listens on the phone and wakes the
+                    // server via DataChannel when "Барон" is heard.
                     Log.d("Govorilka", "server sleep -> mute mic + start local vosk")
-                    handler?.postDelayed({
+                    handler?.post {
                         setMicMuted(true)
                         startLocalVosk()
-                    }, 10000)
+                    }
                 }
                 "awake" -> {
                     Log.d("Govorilka", "server awake -> unmute mic, stop local vosk")

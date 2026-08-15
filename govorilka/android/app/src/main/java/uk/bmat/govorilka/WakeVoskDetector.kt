@@ -103,6 +103,11 @@ class WakeVoskDetector(private val context: Context) {
                 }
                 record.startRecording()
                 val buf = ShortArray(4800) // 100ms
+                // NOTE: no VAD gate here. Vosk must receive the CONTINUOUS
+                // stream — skipping quiet frames between "ба-рон" syllables
+                // broke recognition (the wake word was only caught after
+                // many repetitions). CPU cost is acceptable for the wake
+                // word detector.
                 while (running) {
                     val n = record.read(buf, 0, buf.size)
                     if (n > 0) {
