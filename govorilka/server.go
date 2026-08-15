@@ -61,6 +61,11 @@ type govorilkaPeer struct {
 	sleeping    bool
 	wakeMu      sync.Mutex
 	lastActive  time.Time
+
+	// DataChannel for sleep/wake control commands (Android native client
+	// mutes its mic track when the server sleeps; the client's local Vosk
+	// sends a wake command over this channel to wake the server).
+	dc *webrtc.DataChannel
 }
 
 // handleUtterance runs the voice pipeline for one utterance and sends the
@@ -97,11 +102,11 @@ func (p *govorilkaPeer) handleUtterance(pcm []int16) {
 		// speech) — if no real speech was heard for > 5s, go back to sleep
 		// right away instead of waiting for the full inactivity timeout.
 		p.wakeMu.Lock()
-		if !p.sleeping && p.wake != nil &&
+		sleeping := p.sleeping
+		p.wakeMu.Unlock()
+		if !sleeping && p.wake != nil &&
 			time.Since(p.lastActive) > 5*time.Second {
-			p.sleeping = true
-			// Vosk resets itself after each utterance
-			p.wakeMu.Unlock()
+			p.setSleeping(true)
 			log.Printf("govorilka: noise for 5s -> sleeping (say %q to wake)", "Барон")
 			// Sleep signal: two low beeps ("тук-тук").
 			go func() {
@@ -111,7 +116,6 @@ func (p *govorilkaPeer) handleUtterance(pcm []int16) {
 			}()
 			return
 		}
-		p.wakeMu.Unlock()
 		return
 	}
 	// Only REAL recognized speech extends the active window — noise that
@@ -130,6 +134,9 @@ func (p *govorilkaPeer) handleUtterance(pcm []int16) {
 		p.mu.Lock()
 		p.interrupt = true
 		p.mu.Unlock()
+		// Acknowledge: short low beep so the user knows the command was
+		// accepted (stopping playback is silent otherwise).
+		go p.playClick(900, 12000)
 		return
 	case "повтори":
 		p.mu.Lock()
@@ -145,10 +152,10 @@ func (p *govorilkaPeer) handleUtterance(pcm []int16) {
 	// "молчи" goes to sleep: stop listening, wake up with "Барон".
 	case "молчи":
 		p.wakeMu.Lock()
-		if p.wake != nil {
-			p.sleeping = true
-			// Vosk resets itself after each utterance
-			p.wakeMu.Unlock()
+		hasWake := p.wake != nil
+		p.wakeMu.Unlock()
+		if hasWake {
+			p.setSleeping(true)
 			log.Printf("govorilka: молчи -> sleeping (say %q to wake)", "Барон")
 			// Sleep signal: two low beeps ("тук-тук").
 			go func() {
@@ -156,8 +163,6 @@ func (p *govorilkaPeer) handleUtterance(pcm []int16) {
 				time.Sleep(120 * time.Millisecond)
 				p.playClick(600, 16000)
 			}()
-		} else {
-			p.wakeMu.Unlock()
 		}
 		return
 	}
@@ -170,6 +175,14 @@ func (p *govorilkaPeer) handleUtterance(pcm []int16) {
 		return
 	}
 	defer p.sendMu.Unlock()
+
+	// Clear any stale interrupt flag from a PREVIOUS reply BEFORE starting
+	// brain/TTS. Do NOT clear it right before playback: for long replies the
+	// TTS synthesis takes seconds, and a "хватит" heard during synthesis
+	// must survive to interrupt the playback that follows.
+	p.mu.Lock()
+	p.interrupt = false
+	p.mu.Unlock()
 
 	// ПИК-1 (низкий): фраза принята и отправлена на обработку.
 	p.playClick(1200, 6000)
@@ -207,12 +220,6 @@ func (p *govorilkaPeer) handleUtterance(pcm []int16) {
 
 	// ПИК-2 (высокий): ответ готов, сейчас озвучится.
 	p.playClick(1800, 6000)
-
-	// Clear any stale interrupt flag before starting playback (a previous
-	// "стоп" must not kill this reply).
-	p.mu.Lock()
-	p.interrupt = false
-	p.mu.Unlock()
 
 	p.mu.Lock()
 	out := p.outTrack
@@ -394,6 +401,38 @@ func startGovorilka() {
 	}()
 }
 
+// sendControl sends a JSON control command to the client over the
+// DataChannel (sleep/wake state). The native Android client mutes its mic
+// track when told to sleep, and unmutes on wake.
+func (p *govorilkaPeer) sendControl(obj map[string]any) {
+	if p.dc == nil || p.dc.ReadyState() != webrtc.DataChannelStateOpen {
+		return
+	}
+	if b, err := json.Marshal(obj); err == nil {
+		p.dc.SendText(string(b))
+	}
+}
+
+// setSleeping transitions the peer to/from sleep and notifies the client
+// so it can mute/unmute its mic track.
+func (p *govorilkaPeer) setSleeping(sleeping bool) {
+	p.wakeMu.Lock()
+	p.sleeping = sleeping
+	if sleeping {
+		p.lastActive = time.Time{} // force timeout logic to re-arm
+	} else {
+		// Waking up: reset the inactivity timer so the peer does NOT
+		// immediately fall back asleep (lastActive was zeroed on sleep).
+		p.lastActive = time.Now()
+	}
+	p.wakeMu.Unlock()
+	if sleeping {
+		p.sendControl(map[string]any{"state": "sleep"})
+	} else {
+		p.sendControl(map[string]any{"state": "awake"})
+	}
+}
+
 // govorilkaSignal is the WebSocket signaling endpoint: browser sends
 // offer/candidate, receives answer/candidate.
 func govorilkaSignal(w http.ResponseWriter, r *http.Request) {
@@ -429,6 +468,52 @@ func govorilkaSignal(w http.ResponseWriter, r *http.Request) {
 			voicekit.WakeTimeoutSec())
 	} else {
 		log.Printf("govorilka: wake-word disabled (%v), always listening", err)
+	}
+
+	// Control DataChannel: server -> client sleep/wake state, client ->
+	// server wake command (native Android client with local Vosk).
+	if dc, err := pc.CreateDataChannel("govorilka-ctl", nil); err == nil {
+		peer.dc = dc
+		// When the channel opens, tell the client the CURRENT state — the
+		// peer may already be asleep (new client connecting to a sleeping
+		// server must mute its mic immediately, not only on state changes).
+		dc.OnOpen(func() {
+			peer.wakeMu.Lock()
+			sleeping := peer.sleeping
+			peer.wakeMu.Unlock()
+			state := "awake"
+			if sleeping {
+				state = "sleep"
+			}
+			peer.sendControl(map[string]any{"state": state})
+			log.Printf("govorilka: sent initial state to client: %s", state)
+		})
+		dc.OnMessage(func(msg webrtc.DataChannelMessage) {
+			var cmd struct {
+				Cmd string `json:"cmd"`
+			}
+			if err := json.Unmarshal(msg.Data, &cmd); err != nil {
+				return
+			}
+			switch cmd.Cmd {
+			case "wake":
+				peer.wakeMu.Lock()
+				sleeping := peer.sleeping
+				peer.wakeMu.Unlock()
+				if sleeping {
+					peer.setSleeping(false)
+					log.Printf("govorilka: wake command from client -> listening")
+					// Awake signal: two quick high beeps.
+					go func() {
+						peer.playClick(1200, 16000)
+						time.Sleep(120 * time.Millisecond)
+						peer.playClick(1800, 16000)
+					}()
+				}
+			}
+		})
+	} else {
+		log.Printf("govorilka: control datachannel: %v", err)
 	}
 
 	// Output track carries the synthesized reply back to the browser.
@@ -514,18 +599,23 @@ func govorilkaSignal(w http.ResponseWriter, r *http.Request) {
 			for {
 				time.Sleep(5 * time.Second)
 				peer.wakeMu.Lock()
-				if !peer.sleeping && peer.wake != nil {
-					if time.Since(peer.lastActive) > time.Duration(voicekit.WakeTimeoutSec())*time.Second {
-						peer.sleeping = true
-						// Vosk resets itself after each utterance
-						peer.wakeMu.Unlock()
+				sleeping := peer.sleeping
+				hasWake := peer.wake != nil
+				lastActive := peer.lastActive
+				peer.wakeMu.Unlock()
+				if !sleeping && hasWake {
+					if time.Since(lastActive) > time.Duration(voicekit.WakeTimeoutSec())*time.Second {
+						peer.setSleeping(true)
 						log.Printf("govorilka: idle timeout -> sleeping (say %q to wake)", "Барон")
-						// Sleep signal: one low beep.
-						go peer.playClick(600, 16000)
+						// Sleep signal: two low beeps.
+						go func() {
+							peer.playClick(600, 16000)
+							time.Sleep(120 * time.Millisecond)
+							peer.playClick(600, 16000)
+						}()
 						continue
 					}
 				}
-				peer.wakeMu.Unlock()
 			}
 		}()
 
@@ -566,10 +656,7 @@ func govorilkaSignal(w http.ResponseWriter, r *http.Request) {
 			peer.wakeMu.Unlock()
 			if sleeping && wake != nil {
 				if wake.Feed(pcmBuf[:decoded]) {
-					peer.wakeMu.Lock()
-					peer.sleeping = false
-					peer.lastActive = time.Now()
-					peer.wakeMu.Unlock()
+					peer.setSleeping(false)
 					log.Printf("govorilka: wake word detected -> listening")
 					// Awake signal: two quick high beeps.
 					go func() {

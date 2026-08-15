@@ -27,6 +27,7 @@ import org.webrtc.MediaStream
 import org.webrtc.PeerConnection
 import org.webrtc.PeerConnectionFactory
 import org.webrtc.RTCStatsReport
+import org.webrtc.RtpSender
 import org.webrtc.SessionDescription
 import org.webrtc.VideoDecoderFactory
 import org.webrtc.VideoEncoderFactory
@@ -59,6 +60,9 @@ class VoiceService : Service() {
     private var audioTrack: AudioTrack? = null
     private var localStream: MediaStream? = null
     private var eglBase: EglBase? = null
+    private var dc: org.webrtc.DataChannel? = null
+    private var serverDc: org.webrtc.DataChannel? = null
+    private var micSender: RtpSender? = null
 
     // Native playback of the server's reply is handled by WebRTC itself
     // (WebRtcAudioTrack -> Java AudioTrack), which works in the background
@@ -144,15 +148,17 @@ class VoiceService : Service() {
     override fun onDestroy() {
         disconnect()
         disableBluetoothSco()
-        // Release the microphone (AudioSource holds an AudioRecord until
-        // disposed). Done only here, at service teardown — NOT in
-        // disconnect(), which runs on every reconnect.
-        audioSource?.dispose()
-        audioSource = null
-        audioTrack?.dispose()
-        audioTrack = null
+        stopLocalVosk()
+        // Release WebRTC resources. Order matters: the MediaStream must be
+        // disposed BEFORE its tracks — MediaStream.dispose() removes its
+        // tracks, and a track that was already disposed causes an
+        // IllegalStateException ("MediaStreamTrack has been disposed").
         localStream?.dispose()
         localStream = null
+        audioTrack?.dispose()
+        audioTrack = null
+        audioSource?.dispose()
+        audioSource = null
         handlerThread?.quitSafely()
         wakeLock?.let { if (it.isHeld) it.release() }
         super.onDestroy()
@@ -178,7 +184,13 @@ class VoiceService : Service() {
             .createPeerConnectionFactory()
 
         // Audio: capture mic into an AudioTrack (native, works in background).
+        // DTX (discontinuous transmission): when there is silence, Opus does
+        // not send audio frames (only rare comfort-noise). Saves battery and
+        // network while the peer is "asleep" (server is not listening anyway).
         val audioConstraints = MediaConstraints()
+        audioConstraints.mandatory.add(
+            org.webrtc.MediaConstraints.KeyValuePair("googDtx", "true")
+        )
         audioSource = factory!!.createAudioSource(audioConstraints)
         audioTrack = factory!!.createAudioTrack("govorilka-audio", audioSource)
         localStream = factory!!.createLocalMediaStream("govorilka-stream")
@@ -209,7 +221,28 @@ class VoiceService : Service() {
             override fun onIceCandidatesRemoved(candidates: Array<out IceCandidate>?) {}
             override fun onAddStream(stream: MediaStream?) {}
             override fun onRemoveStream(stream: MediaStream?) {}
-            override fun onDataChannel(channel: org.webrtc.DataChannel?) {}
+            override fun onDataChannel(channel: org.webrtc.DataChannel?) {
+                Log.d("Govorilka", "DataChannel open: ${channel?.label()}")
+                // Keep the server-created control channel: it is the one the
+                // server listens on, so wake commands must go through it.
+                if (channel?.label() == "govorilka-ctl") {
+                    serverDc = channel
+                }
+                channel?.registerObserver(object : org.webrtc.DataChannel.Observer {
+                    override fun onBufferedAmountChange(previousAmount: Long) {}
+                    override fun onStateChange() {
+                        Log.d("Govorilka", "DataChannel state: ${channel.state()}")
+                    }
+                    override fun onMessage(buffer: org.webrtc.DataChannel.Buffer) {
+                        val data = buffer.data
+                        val bytes = ByteArray(data.remaining())
+                        data.get(bytes)
+                        val msg = String(bytes, Charsets.UTF_8)
+                        Log.d("Govorilka", "DataChannel msg: $msg")
+                        handleControlMessage(msg)
+                    }
+                })
+            }
             override fun onRenegotiationNeeded() {}
             override fun onAddTrack(receiver: org.webrtc.RtpReceiver?, streams: Array<out MediaStream>?) {}
             override fun onRemoveTrack(receiver: org.webrtc.RtpReceiver?) {}
@@ -234,7 +267,24 @@ class VoiceService : Service() {
             }
         }
         val connection = factory!!.createPeerConnection(rtcConfig, observer) ?: return null
-        connection.addTrack(audioTrack!!, listOf("govorilka-stream"))
+        micSender = connection.addTrack(audioTrack!!, listOf("govorilka-stream"))
+        // Client -> server control channel (wake command; the server sends
+        // sleep/wake state on ITS channel "govorilka-ctl"). Client channel
+        // has a different label to avoid collision with the server one.
+        val dcInit = org.webrtc.DataChannel.Init()
+        dc = connection.createDataChannel("govorilka-ctl-client", dcInit)
+        dc?.registerObserver(object : org.webrtc.DataChannel.Observer {
+            override fun onBufferedAmountChange(previousAmount: Long) {}
+            override fun onStateChange() {
+                Log.d("Govorilka", "ctl DataChannel state: ${dc?.state()}")
+            }
+            override fun onMessage(buffer: org.webrtc.DataChannel.Buffer) {
+                val data = buffer.data
+                val bytes = ByteArray(data.remaining())
+                data.get(bytes)
+                handleControlMessage(String(bytes, Charsets.UTF_8))
+            }
+        })
         return connection
     }
 
@@ -360,6 +410,85 @@ class VoiceService : Service() {
 
     private fun sendSignal(s: String) {
         ws?.send(s)
+    }
+
+    // Handle control messages from the server over the DataChannel:
+    //   {"state":"sleep"}  — server went to sleep, mute the mic track and
+    //                        start the local Vosk wake-word listener
+    //   {"state":"awake"}  — server woke up, unmute the mic track
+    private fun handleControlMessage(msg: String) {
+        try {
+            val obj = org.json.JSONObject(msg)
+            when (obj.optString("state")) {
+                "sleep" -> {
+                    Log.d("Govorilka", "server sleep -> mute mic + start local vosk")
+                    handler?.postDelayed({
+                        setMicMuted(true)
+                        startLocalVosk()
+                    }, 10000)
+                }
+                "awake" -> {
+                    Log.d("Govorilka", "server awake -> unmute mic, stop local vosk")
+                    handler?.post {
+                        setMicMuted(false)
+                        stopLocalVosk()
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.d("Govorilka", "control msg error: ${e.message}")
+        }
+    }
+
+    // Local Vosk wake-word detector: listens to the mic while the server
+    // sleeps (mic track is muted -> zero network), and wakes the server
+    // via a DataChannel command when "Барон" is heard.
+    private var localVosk: WakeVoskDetector? = null
+
+    private fun startLocalVosk() {
+        if (localVosk?.isRunning == true) return
+        val vosk = WakeVoskDetector(this)
+        vosk.setOnWake {
+            Log.d("Govorilka", "local vosk heard Барон -> wake server")
+            setMicMuted(false)
+            sendWake()
+        }
+        localVosk = vosk
+        vosk.start()
+    }
+
+    private fun stopLocalVosk() {
+        localVosk?.stop()
+        localVosk = null
+    }
+
+    // Mute/unmute the outgoing mic track. When muted, WebRTC stops sending
+    // audio — zero network/battery cost while the server is asleep.
+    private fun setMicMuted(muted: Boolean) {
+        val sender = micSender ?: return
+        val track = sender.track()
+        if (track != null && track.enabled() == muted) {
+            track.setEnabled(!muted)
+            Log.d("Govorilka", "mic track ${if (muted) "muted" else "unmuted"}")
+        }
+    }
+
+    // Send a wake command to the server over the DataChannel (used by the
+    // client-side Vosk when it hears "Барон" while the server sleeps).
+    // The server listens on ITS channel "govorilka-ctl", so the command
+    // must go through that channel — the client-created channel is not
+    // accepted by the server and stays closed.
+    private fun sendWake() {
+        val ch = serverDc ?: dc ?: return
+        if (ch.state() == org.webrtc.DataChannel.State.OPEN) {
+            ch.send(org.webrtc.DataChannel.Buffer(
+                java.nio.ByteBuffer.wrap("{\"cmd\":\"wake\"}".toByteArray()),
+                false
+            ))
+            Log.d("Govorilka", "wake command sent to server")
+        } else {
+            Log.d("Govorilka", "wake NOT sent, dc state: ${ch.state()}")
+        }
     }
 
     private fun disconnect() {

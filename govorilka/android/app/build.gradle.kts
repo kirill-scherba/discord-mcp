@@ -35,4 +35,5 @@ dependencies {
     implementation("androidx.webkit:webkit:1.9.0")
     implementation("io.github.webrtc-sdk:android:125.6422.04")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    implementation("com.alphacephei:vosk-android:0.3.47")
 }
