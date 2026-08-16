@@ -62,6 +62,40 @@ class MainActivity : AppCompatActivity() {
         passInput.setText(savedPass())
         column.addView(passInput)
 
+        // Server selector: Hetzner (with server-side Vosk, for web) or RU
+        // VPS (lightweight, no server Vosk — the app's local Vosk wakes it).
+        val serverLabel = TextView(this)
+        serverLabel.text = "Сервер:"
+        serverLabel.textSize = 16f
+        column.addView(serverLabel)
+
+        val serverGroup = android.widget.RadioGroup(this)
+        serverGroup.orientation = android.widget.RadioGroup.VERTICAL
+        val servers = arrayOf(
+            "hetzner" to "Hetzner (govorilka.bmat.uk)",
+            "ru" to "RU VPS (govorilka-ru.bmat.uk)"
+        )
+        val savedServer = savedServer()
+        var srvId = 2000
+        for ((key, label) in servers) {
+            val rb = android.widget.RadioButton(this)
+            rb.id = srvId++
+            rb.text = label
+            rb.tag = key
+            rb.isChecked = (key == savedServer)
+            serverGroup.addView(rb)
+        }
+        serverGroup.setOnCheckedChangeListener { _, checkedId ->
+            val rb = serverGroup.findViewById<android.widget.RadioButton>(checkedId)
+            val key = rb?.tag as? String ?: "hetzner"
+            getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .edit().putString("server", key).apply()
+            Log.d("Govorilka", "server set: $key")
+            // Apply to the running service immediately (reconnect with new host).
+            VoiceService.applyServerImmediate(this)
+        }
+        column.addView(serverGroup)
+
         // Audio route selector (like the speaker button in call apps).
         val routeLabel = TextView(this)
         routeLabel.text = "Звук:"
@@ -152,6 +186,9 @@ class MainActivity : AppCompatActivity() {
 
     private fun savedRoute(): String =
         getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString("route", "auto") ?: "auto"
+
+    private fun savedServer(): String =
+        getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString("server", "hetzner") ?: "hetzner"
 
     // Полная остановка: стоп сервиса и закрытие приложения.
     private fun stopEverything() {

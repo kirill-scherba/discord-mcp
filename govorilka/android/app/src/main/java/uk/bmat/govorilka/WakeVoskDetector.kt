@@ -23,10 +23,11 @@ class WakeVoskDetector(private val context: Context) {
     private var rec: Recognizer? = null
     private var thread: Thread? = null
     private var running = false
-    private var onWake: (() -> Unit)? = null
+    // Command callback: "барон" -> wake, "хватит" -> stop, "молчи" -> sleep.
+    private var onCommand: ((String) -> Unit)? = null
 
-    fun setOnWake(cb: () -> Unit) {
-        onWake = cb
+    fun setOnCommand(cb: (String) -> Unit) {
+        onCommand = cb
     }
 
     /** Extract the model from assets (once) and return its dir. */
@@ -119,10 +120,16 @@ class WakeVoskDetector(private val context: Context) {
                         if (r.acceptWaveForm(pcm, pcm.size)) {
                             val res = org.json.JSONObject(r.result)
                             val text = res.optString("text", "").lowercase()
-                            if (text.contains("барон")) {
-                                Log.d("Govorilka", "vosk: wake word heard: $text")
+                            val cmd = when {
+                                text.contains("барон") -> "барон"
+                                text.contains("хват") || text.contains("останов") -> "хватит"
+                                text.contains("молч") || text.contains("замолч") -> "молчи"
+                                else -> ""
+                            }
+                            if (cmd.isNotEmpty()) {
+                                Log.d("Govorilka", "vosk: command heard: $text -> $cmd")
                                 running = false
-                                onWake?.invoke()
+                                onCommand?.invoke(cmd)
                                 break
                             }
                         }

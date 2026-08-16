@@ -71,6 +71,7 @@ class VoiceService : Service() {
     override fun onCreate() {
         super.onCreate()
         Log.d("Govorilka", "VoiceService onCreate")
+        instance = this
         acquireWakeLock()
         // Apply the audio route chosen in MainActivity (auto/phone/speaker/bt).
         applyAudioRoute()
@@ -146,6 +147,7 @@ class VoiceService : Service() {
     }
 
     override fun onDestroy() {
+        instance = null
         disconnect()
         disableBluetoothSco()
         stopLocalVosk()
@@ -304,8 +306,13 @@ class VoiceService : Service() {
                 val prefs = getSharedPreferences("govorilka_prefs", Context.MODE_PRIVATE)
                 val login = prefs.getString("login", "") ?: ""
                 val pass = prefs.getString("pass", "") ?: ""
+                // Server host: "hetzner" (govorilka.bmat.uk, with Vosk) or
+                // "ru" (govorilka-ru.bmat.uk, lightweight, RU VPS).
+                val host = prefs.getString("server", "hetzner") ?: "hetzner"
+                val wssHost = if (host == "ru") "govorilka-ru.bmat.uk" else "govorilka.bmat.uk"
+                Log.d("Govorilka", "connecting to $wssHost")
                 var reqBuilder = Request.Builder()
-                    .url("wss://govorilka.bmat.uk/signal")
+                    .url("wss://$wssHost/signal")
                 if (login.isNotEmpty() && pass.isNotEmpty()) {
                     val cred = java.util.Base64.getEncoder()
                         .encodeToString("$login:$pass".toByteArray(Charsets.UTF_8))
@@ -416,15 +423,15 @@ class VoiceService : Service() {
     //   {"state":"sleep"}  — server went to sleep, mute the mic track and
     //                        start the local Vosk wake-word listener
     //   {"state":"awake"}  — server woke up, unmute the mic track
+    // NOTE: the local Vosk can only run while the mic track is MUTED —
+    // Android gives the microphone to one consumer at a time. While awake
+    // (WebRTC active) бarge-in "хватит"/"молчи" goes through the server
+    // STT as usual.
     private fun handleControlMessage(msg: String) {
         try {
             val obj = org.json.JSONObject(msg)
             when (obj.optString("state")) {
                 "sleep" -> {
-                    // Mute immediately: the server is asleep and not
-                    // listening, so any audio sent now is wasted traffic.
-                    // The local Vosk listens on the phone and wakes the
-                    // server via DataChannel when "Барон" is heard.
                     Log.d("Govorilka", "server sleep -> mute mic + start local vosk")
                     handler?.post {
                         setMicMuted(true)
@@ -452,10 +459,19 @@ class VoiceService : Service() {
     private fun startLocalVosk() {
         if (localVosk?.isRunning == true) return
         val vosk = WakeVoskDetector(this)
-        vosk.setOnWake {
-            Log.d("Govorilka", "local vosk heard Барон -> wake server")
-            setMicMuted(false)
-            sendWake()
+        vosk.setOnCommand { cmd ->
+            Log.d("Govorilka", "local vosk command: $cmd")
+            when (cmd) {
+                "барон" -> {
+                    setMicMuted(false)
+                    sendCommand("wake")
+                }
+                "хватит" -> sendCommand("stop")
+                "молчи" -> {
+                    setMicMuted(true)
+                    sendCommand("sleep")
+                }
+            }
         }
         localVosk = vosk
         vosk.start()
@@ -477,21 +493,18 @@ class VoiceService : Service() {
         }
     }
 
-    // Send a wake command to the server over the DataChannel (used by the
-    // client-side Vosk when it hears "Барон" while the server sleeps).
-    // The server listens on ITS channel "govorilka-ctl", so the command
-    // must go through that channel — the client-created channel is not
-    // accepted by the server and stays closed.
-    private fun sendWake() {
+    // Send a control command (wake/stop/sleep) to the server over the
+    // DataChannel. The server listens on ITS channel "govorilka-ctl".
+    private fun sendCommand(cmd: String) {
         val ch = serverDc ?: dc ?: return
         if (ch.state() == org.webrtc.DataChannel.State.OPEN) {
             ch.send(org.webrtc.DataChannel.Buffer(
-                java.nio.ByteBuffer.wrap("{\"cmd\":\"wake\"}".toByteArray()),
+                java.nio.ByteBuffer.wrap("{\"cmd\":\"$cmd\"}".toByteArray()),
                 false
             ))
-            Log.d("Govorilka", "wake command sent to server")
+            Log.d("Govorilka", "command sent to server: $cmd")
         } else {
-            Log.d("Govorilka", "wake NOT sent, dc state: ${ch.state()}")
+            Log.d("Govorilka", "command NOT sent ($cmd), dc state: ${ch.state()}")
         }
     }
 
@@ -603,6 +616,21 @@ class VoiceService : Service() {
     companion object {
         @Volatile
         private var appContext: Context? = null
+
+        @Volatile
+        private var instance: VoiceService? = null
+
+        // Called from MainActivity when the user switches the server host:
+        // reconnect to the new host (re-reads the URL from prefs in connect()).
+        fun applyServerImmediate(context: Context) {
+            appContext = context.applicationContext
+            instance?.let { svc ->
+                svc.handler?.post {
+                    svc.disconnect()
+                    svc.connect()
+                }
+            }
+        }
 
         // Called from MainActivity when the user switches the audio route:
         // applies the new route to the running service WITHOUT restarting
