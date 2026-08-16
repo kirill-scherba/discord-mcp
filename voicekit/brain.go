@@ -12,7 +12,26 @@ import (
 )
 
 // opencodeBaseURL is the opencode-serve instance for voice sessions.
-const opencodeBaseURL = "http://127.0.0.1:7712"
+// Override with env BRAIN_URL (e.g. https://bmat.uk:7712 with auth) when
+// the Govorilka server runs on a different host than opencode.
+func brainBaseURL() string {
+	if u := os.Getenv("BRAIN_URL"); u != "" {
+		return u
+	}
+	return "http://127.0.0.1:7712"
+}
+
+// brainBasicAuth returns optional HTTP Basic Auth credentials for the
+// brain endpoint (env BRAIN_USER / BRAIN_PASS) — used when Govorilka runs
+// on a remote host and the opencode-serve endpoint is behind nginx auth.
+func brainBasicAuth() (string, string) {
+	u := os.Getenv("BRAIN_USER")
+	p := os.Getenv("BRAIN_PASS")
+	if u != "" {
+		return u, p
+	}
+	return "", ""
+}
 
 var (
 	brainMu   sync.Mutex
@@ -79,7 +98,11 @@ func getBrainSession() (*opencodeclient.Session, error) {
 	brainMu.Lock()
 	defer brainMu.Unlock()
 	if brainCl == nil {
-		brainCl = opencodeclient.New(opencodeBaseURL, 0)
+		brainCl = opencodeclient.New(brainBaseURL(), 0)
+		if u, p := brainBasicAuth(); u != "" {
+			brainCl.SetBasicAuth(u, p)
+			log.Printf("brain: basic auth configured for %s", brainBaseURL())
+		}
 	}
 	if brainSess == nil {
 		if ps := persistedSession(); ps != nil {
@@ -96,14 +119,30 @@ func getBrainSession() (*opencodeclient.Session, error) {
 	return brainSess, nil
 }
 
-// isSessionGone reports whether the error means the session disappeared.
+// isSessionGone reports whether the error means the session disappeared or
+// became unusable (e.g. the opencode-serve was restarted, the session state
+// was lost, and requests time out). Treat timeouts and any transport error
+// as "session gone" so we recreate it instead of hanging forever.
 func isSessionGone(err error) bool {
 	if err == nil {
 		return false
 	}
 	s := err.Error()
-	return len(s) > 0 && (contains(s, "404") || contains(s, "Session not found") ||
-		contains(s, "NotFoundError") || contains(s, "session not found"))
+	if len(s) == 0 {
+		return false
+	}
+	if contains(s, "404") || contains(s, "Session not found") ||
+		contains(s, "NotFoundError") || contains(s, "session not found") {
+		return true
+	}
+	// Transport errors: timeouts, connection refused/reset, EOF, etc.
+	if contains(s, "deadline exceeded") || contains(s, "timeout") ||
+		contains(s, "connection refused") || contains(s, "connection reset") ||
+		contains(s, "EOF") || contains(s, "unexpected end of JSON") ||
+		contains(s, "empty reply") {
+		return true
+	}
+	return false
 }
 
 func contains(s, sub string) bool {
