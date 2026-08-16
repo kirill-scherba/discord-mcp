@@ -52,6 +52,11 @@ type govorilkaPeer struct {
 	lastReply string
 	interrupt bool
 
+	// replying is true while a reply is being played back (used by the
+	// native client to skip STT during playback — its local Vosk handles
+	// barge-in).
+	replying bool
+
 	// Wake-word (sleep/wake) state: the peer starts ASLEEP and only runs
 	// the STT -> brain -> TTS pipeline after "Барон" is detected. An
 	// inactivity timeout returns it to sleep, saving Yandex STT money.
@@ -66,6 +71,12 @@ type govorilkaPeer struct {
 	// mutes its mic track when the server sleeps; the client's local Vosk
 	// sends a wake command over this channel to wake the server).
 	dc *webrtc.DataChannel
+
+	// isNative marks the native Android client (it opens its own
+	// DataChannel "govorilka-ctl-client" and runs a local Vosk for
+	// барон/хватит/молчи). Such clients do not need the server to listen
+	// for barge-in during playback — saving STT on background noise.
+	isNative bool
 }
 
 // handleUtterance runs the voice pipeline for one utterance and sends the
@@ -104,8 +115,7 @@ func (p *govorilkaPeer) handleUtterance(pcm []int16) {
 		p.wakeMu.Lock()
 		sleeping := p.sleeping
 		p.wakeMu.Unlock()
-		if !sleeping && p.wake != nil &&
-			time.Since(p.lastActive) > 5*time.Second {
+		if !sleeping && time.Since(p.lastActive) > 5*time.Second {
 			p.setSleeping(true)
 			log.Printf("govorilka: noise for 5s -> sleeping (say %q to wake)", "Барон")
 			// Sleep signal: two low beeps ("тук-тук").
@@ -151,19 +161,14 @@ func (p *govorilkaPeer) handleUtterance(pcm []int16) {
 		return
 	// "молчи" goes to sleep: stop listening, wake up with "Барон".
 	case "молчи":
-		p.wakeMu.Lock()
-		hasWake := p.wake != nil
-		p.wakeMu.Unlock()
-		if hasWake {
-			p.setSleeping(true)
-			log.Printf("govorilka: молчи -> sleeping (say %q to wake)", "Барон")
-			// Sleep signal: two low beeps ("тук-тук").
-			go func() {
-				p.playClick(600, 16000)
-				time.Sleep(120 * time.Millisecond)
-				p.playClick(600, 16000)
-			}()
-		}
+		p.setSleeping(true)
+		log.Printf("govorilka: молчи -> sleeping (say %q to wake)", "Барон")
+		// Sleep signal: two low beeps ("тук-тук").
+		go func() {
+			p.playClick(600, 16000)
+			time.Sleep(120 * time.Millisecond)
+			p.playClick(600, 16000)
+		}()
 		return
 	}
 
@@ -175,6 +180,15 @@ func (p *govorilkaPeer) handleUtterance(pcm []int16) {
 		return
 	}
 	defer p.sendMu.Unlock()
+
+	// For the native Android client: it runs a local Vosk and sends
+	// barge-in ("хватит") via DataChannel, so the server does NOT need to
+	// listen during playback. Drop everything while a reply is playing to
+	// avoid paying STT for background noise on the client side.
+	if p.isNative && p.replying {
+		log.Printf("govorilka: native client, reply in progress -> drop (no STT)")
+		return
+	}
 
 	// Clear any stale interrupt flag from a PREVIOUS reply BEFORE starting
 	// brain/TTS. Do NOT clear it right before playback: for long replies the
@@ -235,6 +249,9 @@ func (p *govorilkaPeer) handleUtterance(pcm []int16) {
 	// speed (20ms per frame) so the browser jitter buffer is not flooded.
 	ssrc := uint32(4242)
 	frameDur := 20 * time.Millisecond
+	p.mu.Lock()
+	p.replying = true
+	p.mu.Unlock()
 	for _, f := range frames {
 		pkt := &rtp.Packet{
 			Header: rtp.Header{
@@ -266,6 +283,7 @@ func (p *govorilkaPeer) handleUtterance(pcm []int16) {
 	p.seq = seq
 	p.ts = ts
 	p.interrupt = false
+	p.replying = false
 	p.mu.Unlock()
 }
 
@@ -443,12 +461,31 @@ func govorilkaSignal(w http.ResponseWriter, r *http.Request) {
 	}
 	defer ws.Close()
 
-	// Create peer connection with Opus codec.
-	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{
-		ICEServers: []webrtc.ICEServer{{URLs: []string{"stun:stun.l.google.com:19302"}}},
-	})
-	if err != nil {
-		log.Printf("govorilka: pc: %v", err)
+	// Create peer connection with Opus codec. STUN server is configurable
+	// via GOV_STUN (default Google). If the server is behind NAT with a
+	// known public IP (e.g. reg.ru VPS: 192.168.x.x inside, 194.58.x.x
+	// outside), set GOV_EXTERNAL_IP so WebRTC advertises it directly
+	// instead of relying on STUN (which may be blocked/unavailable).
+	stun := os.Getenv("GOV_STUN")
+	if stun == "" {
+		stun = "stun:stun.l.google.com:19302"
+	}
+	cfg := webrtc.Configuration{
+		ICEServers: []webrtc.ICEServer{{URLs: []string{stun}}},
+	}
+	var pc *webrtc.PeerConnection
+	var pcErr error
+	if ext := os.Getenv("GOV_EXTERNAL_IP"); ext != "" {
+		s := webrtc.SettingEngine{}
+		s.SetNAT1To1IPs([]string{ext}, webrtc.ICECandidateTypeHost)
+		api := webrtc.NewAPI(webrtc.WithSettingEngine(s))
+		pc, pcErr = api.NewPeerConnection(cfg)
+		log.Printf("govorilka: external IP override: %s", ext)
+	} else {
+		pc, pcErr = webrtc.NewPeerConnection(cfg)
+	}
+	if pcErr != nil {
+		log.Printf("govorilka: pc: %v", pcErr)
 		return
 	}
 	// NOTE: pc is NOT closed when the signaling ws closes. The browser closes
@@ -510,11 +547,42 @@ func govorilkaSignal(w http.ResponseWriter, r *http.Request) {
 						peer.playClick(1800, 16000)
 					}()
 				}
+			case "sleep":
+				peer.wakeMu.Lock()
+				sleeping := peer.sleeping
+				peer.wakeMu.Unlock()
+				if !sleeping {
+					peer.setSleeping(true)
+					log.Printf("govorilka: sleep command from client -> sleeping")
+					// Sleep signal: two low beeps.
+					go func() {
+						peer.playClick(600, 16000)
+						time.Sleep(120 * time.Millisecond)
+						peer.playClick(600, 16000)
+					}()
+				}
+			case "stop":
+				peer.mu.Lock()
+				peer.interrupt = true
+				peer.mu.Unlock()
+				log.Printf("govorilka: stop command from client -> interrupt")
+				go peer.playClick(900, 12000)
 			}
 		})
 	} else {
 		log.Printf("govorilka: control datachannel: %v", err)
 	}
+
+	// Detect the native Android client: it opens its own control channel
+	// "govorilka-ctl-client" (for барон/хватит/молчи via local Vosk).
+	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
+		if dc.Label() == "govorilka-ctl-client" {
+			peer.wakeMu.Lock()
+			peer.isNative = true
+			peer.wakeMu.Unlock()
+			log.Printf("govorilka: native android client detected")
+		}
+	})
 
 	// Output track carries the synthesized reply back to the browser.
 	// The earlier acoustic loop was caused by HTML auto-playing the received
@@ -574,15 +642,15 @@ func govorilkaSignal(w http.ResponseWriter, r *http.Request) {
 					active = false
 					mu.Unlock()
 					log.Printf("govorilka: timer fired, utterance %d samples", len(utterance))
-					// While asleep, feed the utterance to the wake-word
-					// detector instead of running STT.
+					// While asleep, do NOT feed utterances to STT.
 					peer.wakeMu.Lock()
 					sleeping := peer.sleeping
-					wake := peer.wake
 					peer.wakeMu.Unlock()
-					if sleeping && wake != nil {
-						// Vosk listens continuously in the main RTP loop;
-						// nothing to do here for sleep mode.
+					if sleeping {
+						// While asleep we do NOT process utterances: either
+						// the server-side Vosk listens in the main loop, or
+						// (build without vosk) the client wakes us via a
+						// DataChannel command. Either way no STT cost here.
 					} else {
 						go peer.handleUtterance(utterance)
 					}
@@ -600,10 +668,9 @@ func govorilkaSignal(w http.ResponseWriter, r *http.Request) {
 				time.Sleep(5 * time.Second)
 				peer.wakeMu.Lock()
 				sleeping := peer.sleeping
-				hasWake := peer.wake != nil
 				lastActive := peer.lastActive
 				peer.wakeMu.Unlock()
-				if !sleeping && hasWake {
+				if !sleeping {
 					if time.Since(lastActive) > time.Duration(voicekit.WakeTimeoutSec())*time.Second {
 						peer.setSleeping(true)
 						log.Printf("govorilka: idle timeout -> sleeping (say %q to wake)", "Барон")
