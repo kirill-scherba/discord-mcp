@@ -1,3 +1,5 @@
+//go:build vosk
+
 // Wake-word detection via local Vosk speech recognition.
 //
 // The DTW approach (wake_dtw) cannot reliably separate "Барон" from
