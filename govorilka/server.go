@@ -14,6 +14,7 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -26,6 +27,16 @@ import (
 
 // govorilkaAddr is where the prototype page + signaling listen.
 const govorilkaAddr = ":7790"
+
+// NoiseSleepAfter is how long continuous non-speech noise (STT empty) must
+// last before the peer goes back to sleep. The timer starts at the FIRST
+// noise utterance and resets on real speech.
+const NoiseSleepAfter = 5 // seconds
+
+// NoiseGapReset is the maximum pause between noise utterances that still
+// counts as one continuous streak. A longer silence expires the streak, so
+// a burst of noise does not accumulate across a pause.
+const NoiseGapReset = 2 // seconds
 
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
@@ -66,6 +77,15 @@ type govorilkaPeer struct {
 	sleeping    bool
 	wakeMu      sync.Mutex
 	lastActive  time.Time
+	// noiseSince is set when the FIRST noise utterance arrives (STT empty
+	// after the energy gate) and cleared by real speech. The peer goes to
+	// sleep when noise has been continuous for NoiseSleepAfter (5s) — i.e.
+	// the timer counts from the FIRST noise, not from the last speech.
+	// lastNoise is the time of the LAST noise utterance: the watchdog uses
+	// it to expire the timer when the noise actually stopped (no new noise
+	// for 5s), so a continuous noise with short gaps keeps the streak.
+	noiseSince time.Time
+	lastNoise  time.Time
 
 	// DataChannel for sleep/wake control commands (Android native client
 	// mutes its mic track when the server sleeps; the client's local Vosk
@@ -109,29 +129,48 @@ func (p *govorilkaPeer) handleUtterance(pcm []int16) {
 	text = voicekit.TrimWhitespace(text)
 	if text == "" {
 		log.Printf("govorilka: STT empty (noise), %dms audio", len(pcm)/48)
-		// Fast sleep: continuous noise (passed the energy gate but not
-		// speech) — if no real speech was heard for > 5s, go back to sleep
-		// right away instead of waiting for the full inactivity timeout.
+		// Noise detection: the peer sleeps after continuous noise that is
+		// NOT speech. The timer starts at the FIRST noise utterance and is
+		// reset by real speech. The streak continues only while noise keeps
+		// arriving with gaps shorter than NoiseGapReset (2s); after a
+		// longer silence the timer is dropped, so a burst of noise does
+		// NOT accumulate across a pause. The peer sleeps after
+		// NoiseSleepAfter (5s) of uninterrupted noise.
 		p.wakeMu.Lock()
 		sleeping := p.sleeping
-		p.wakeMu.Unlock()
-		if !sleeping && time.Since(p.lastActive) > 5*time.Second {
-			p.setSleeping(true)
-			log.Printf("govorilka: noise for 5s -> sleeping (say %q to wake)", "Барон")
-			// Sleep signal: two low beeps ("тук-тук").
-			go func() {
-				p.playClick(600, 16000)
-				time.Sleep(120 * time.Millisecond)
-				p.playClick(600, 16000)
-			}()
-			return
+		if !sleeping {
+			now := time.Now()
+			if !p.noiseSince.IsZero() && now.Sub(p.lastNoise) <= NoiseGapReset*time.Second {
+				// Noise continues (gap from the last noise is small):
+				// if the whole streak is long enough, go to sleep.
+				if now.Sub(p.noiseSince) >= NoiseSleepAfter*time.Second {
+					p.wakeMu.Unlock()
+					p.setSleeping(true)
+					log.Printf("govorilka: noise for %ds -> sleeping (say %q to wake)", NoiseSleepAfter, "Барон")
+					// Sleep signal: two low beeps ("тук-тук").
+					go func() {
+						p.playClick(600, 16000)
+						time.Sleep(120 * time.Millisecond)
+						p.playClick(600, 16000)
+					}()
+					return
+				}
+			} else {
+				// First noise, or the previous streak is stale (silence
+				// longer than NoiseGapReset) — start a fresh streak.
+				p.noiseSince = now
+			}
+			p.lastNoise = now
 		}
+		p.wakeMu.Unlock()
 		return
 	}
 	// Only REAL recognized speech extends the active window — noise that
 	// passed the energy gate (loud hum, music) must NOT delay sleep.
 	p.wakeMu.Lock()
 	p.lastActive = time.Now()
+	p.noiseSince = time.Time{} // real speech breaks the noise streak
+	p.lastNoise = time.Time{}
 	p.wakeMu.Unlock()
 	log.Printf("govorilka: heard: %q", text)
 
@@ -170,12 +209,28 @@ func (p *govorilkaPeer) handleUtterance(pcm []int16) {
 			p.playClick(600, 16000)
 		}()
 		return
+	// "барон" while AWAKE is an attention call: interrupt any playback in
+	// progress and fall through to the normal brain pipeline with the rest
+	// of the phrase. This way a "барон, ..." spoken over a stuck reply is
+	// NOT dropped as a tail.
+	case "барон":
+		log.Printf("govorilka: барон while awake -> interrupt, continue")
+		p.mu.Lock()
+		p.interrupt = true
+		p.mu.Unlock()
+		// Fall through to the brain pipeline below.
 	}
 
 	// Tail rejection for ordinary speech: if a previous reply is still being
 	// sent, this is a tail of the same phrase — drop it. Commands above are
-	// NOT dropped (they must break through to interrupt/mute).
-	if !p.sendMu.TryLock() {
+	// NOT dropped (they must break through to interrupt/mute). "барон" is
+	// special: it waits for the pipeline (interrupt was already set, so the
+	// stuck reply is aborted at the next frame) instead of dropping.
+	if cmd == "барон" {
+		// The interrupt set above aborts playback at the next frame check;
+		// wait for sendMu to free so the attention call is not lost.
+		p.sendMu.Lock()
+	} else if !p.sendMu.TryLock() {
 		log.Printf("govorilka: tail dropped (previous still processing)")
 		return
 	}
@@ -200,6 +255,16 @@ func (p *govorilkaPeer) handleUtterance(pcm []int16) {
 
 	// ПИК-1 (низкий): фраза принята и отправлена на обработку.
 	p.playClick(1200, 6000)
+
+	// Strip the leading "барон" from the text sent to the brain — the name
+	// is the attention call, not part of the question.
+	if cmd == "барон" {
+		text = voicekit.TrimWhitespace(strings.TrimSpace(
+			strings.TrimPrefix(strings.ToLower(text), "барон")))
+		if text == "" {
+			text = "Да?" // just the name was spoken
+		}
+	}
 
 	reply, err := voicekit.BrainAsk(text)
 	if err != nil {
@@ -252,6 +317,12 @@ func (p *govorilkaPeer) handleUtterance(pcm []int16) {
 	p.mu.Lock()
 	p.replying = true
 	p.mu.Unlock()
+	// Playback deadline: if the client stops consuming RTP (e.g. mobile
+	// network dropped, app muted), WriteRTP would block forever and hold
+	// sendMu — making even "Барон" drop as a tail. Cap the playback at the
+	// reply duration plus a small margin, and abort if the client is not
+	// keeping up.
+	playbackDeadline := time.Now().Add(time.Duration(len(frames)) * frameDur).Add(10 * time.Second)
 	for _, f := range frames {
 		pkt := &rtp.Packet{
 			Header: rtp.Header{
@@ -269,6 +340,11 @@ func (p *govorilkaPeer) handleUtterance(pcm []int16) {
 		p.mu.Unlock()
 		if interrupted {
 			log.Printf("govorilka: interrupted, stopping playback")
+			break
+		}
+		// If the client stopped consuming, abort after the deadline.
+		if time.Now().After(playbackDeadline) {
+			log.Printf("govorilka: playback deadline exceeded, aborting send (client not consuming)")
 			break
 		}
 		if err := out.WriteRTP(pkt); err != nil {
@@ -436,6 +512,8 @@ func (p *govorilkaPeer) sendControl(obj map[string]any) {
 func (p *govorilkaPeer) setSleeping(sleeping bool) {
 	p.wakeMu.Lock()
 	p.sleeping = sleeping
+	p.noiseSince = time.Time{} // reset the noise streak on any transition
+	p.lastNoise = time.Time{}
 	if sleeping {
 		p.lastActive = time.Time{} // force timeout logic to re-arm
 	} else {
@@ -670,18 +748,19 @@ func govorilkaSignal(w http.ResponseWriter, r *http.Request) {
 				sleeping := peer.sleeping
 				lastActive := peer.lastActive
 				peer.wakeMu.Unlock()
-				if !sleeping {
-					if time.Since(lastActive) > time.Duration(voicekit.WakeTimeoutSec())*time.Second {
-						peer.setSleeping(true)
-						log.Printf("govorilka: idle timeout -> sleeping (say %q to wake)", "Барон")
-						// Sleep signal: two low beeps.
-						go func() {
-							peer.playClick(600, 16000)
-							time.Sleep(120 * time.Millisecond)
-							peer.playClick(600, 16000)
-						}()
-						continue
-					}
+				if sleeping {
+					continue
+				}
+				if time.Since(lastActive) > time.Duration(voicekit.WakeTimeoutSec())*time.Second {
+					peer.setSleeping(true)
+					log.Printf("govorilka: idle timeout -> sleeping (say %q to wake)", "Барон")
+					// Sleep signal: two low beeps.
+					go func() {
+						peer.playClick(600, 16000)
+						time.Sleep(120 * time.Millisecond)
+						peer.playClick(600, 16000)
+					}()
+					continue
 				}
 			}
 		}()
