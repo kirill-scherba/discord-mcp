@@ -16,8 +16,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cartridge-gg/discordgo"
-	"github.com/cartridge-gg/discordgo/dave"
+	"github.com/kirill-scherba/discordgo"
+	"github.com/kirill-scherba/discordgo/dave"
 	"github.com/mark3labs/mcp-go/mcp"
 )
 

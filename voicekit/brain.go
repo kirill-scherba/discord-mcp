@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/kirill-scherba/opencode-client"
 )
@@ -98,7 +99,15 @@ func getBrainSession() (*opencodeclient.Session, error) {
 	brainMu.Lock()
 	defer brainMu.Unlock()
 	if brainCl == nil {
-		brainCl = opencodeclient.New(brainBaseURL(), 0)
+		// On the RU server the path to the brain goes through a stateful
+		// firewall/DPI (reg.ru → Cloudflare) that silently kills idle
+		// keep-alive connections — reusing them made requests hang.
+		// Open a fresh connection per request (like nginx/curl) and cap
+		// the idle pool short as well.
+		brainCl = opencodeclient.New(brainBaseURL(), 0, opencodeclient.Options{
+			DisableKeepAlives: true,
+			IdleConnTimeout:   30 * time.Second,
+		})
 		if u, p := brainBasicAuth(); u != "" {
 			brainCl.SetBasicAuth(u, p)
 			log.Printf("brain: basic auth configured for %s", brainBaseURL())

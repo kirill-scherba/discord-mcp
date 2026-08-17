@@ -7,7 +7,7 @@ import (
 	"math"
 	"time"
 
-	"github.com/cartridge-gg/discordgo"
+	"github.com/kirill-scherba/discordgo"
 	"github.com/hraban/opus"
 	"github.com/kirill-scherba/discord-mcp/voicekit"
 )
