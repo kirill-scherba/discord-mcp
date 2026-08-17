@@ -46,3 +46,5 @@ require (
 )
 
 replace github.com/cartridge-gg/discordgo => /home/kirill/go/src/github.com/cartridge-gg/discordgo
+
+replace github.com/kirill-scherba/opencode-client => /home/kirill/go/src/github.com/kirill-scherba/opencode-client
