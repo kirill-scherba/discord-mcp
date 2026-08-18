@@ -60,6 +60,13 @@ type govorilkaPeer struct {
 	seq uint16
 	ts  uint32
 
+	// sessionStart is when this peer was created. After an interrupt +
+	// pause the client jitter buffer (NetEq) has advanced past our
+	// continuing ts, so a reply resuming with the old ts arrives "in the
+	// past" and is dropped as late. We jump ts forward to wall-clock time
+	// (see syncTs) so the client plays the new talkspurt from the start.
+	sessionStart time.Time
+
 	// Voice commands state (mirrors the Discord bot):
 	lastReply string
 	interrupt bool
@@ -98,6 +105,23 @@ type govorilkaPeer struct {
 	// барон/хватит/молчи). Such clients do not need the server to listen
 	// for barge-in during playback — saving STT on background noise.
 	isNative bool
+}
+
+// syncTs returns the RTP timestamp for a new talkspurt, jumping it forward
+// to wall-clock time if the peer has been idle. Called under p.mu.
+// After an interrupt + TTS pause the client's jitter buffer (NetEq) has
+// advanced past our continuing ts, so a reply that resumes with the old
+// value arrives "in the past" and is dropped as late. Jumping ts forward
+// tells the client this is a fresh talkspurt and it plays from the start.
+// seq keeps counting (resetting seq wraps to 0 and the client drops the
+// packets as stale — that was the original "only first reply plays" bug).
+func (p *govorilkaPeer) syncTs(ts uint32) uint32 {
+	real := uint32(time.Since(p.sessionStart).Nanoseconds() * 48000 / 1e9)
+	if real > ts {
+		log.Printf("govorilka: ts jump %d -> %d (resume after pause)", ts, real)
+		return real
+	}
+	return ts
 }
 
 // handleUtterance runs the voice pipeline for one utterance and sends the
@@ -255,7 +279,7 @@ func (p *govorilkaPeer) handleUtterance(pcm []int16) {
 	p.mu.Unlock()
 
 	// ПИК-1 (низкий): фраза принята и отправлена на обработку.
-	p.playClick(1200, 6000)
+	p.playClickLocked(1200, 6000)
 
 	// Strip the leading "барон" from the text sent to the brain — the name
 	// is the attention call, not part of the question.
@@ -306,12 +330,12 @@ func (p *govorilkaPeer) handleUtterance(pcm []int16) {
 	log.Printf("govorilka: sending %d opus frames", len(frames))
 
 	// ПИК-2 (высокий): ответ готов, сейчас озвучится.
-	p.playClick(1800, 6000)
+	p.playClickLocked(1800, 6000)
 
 	p.mu.Lock()
 	out := p.outTrack
 	seq := p.seq
-	ts := p.ts
+	ts := p.syncTs(p.ts)
 	p.mu.Unlock()
 	if out == nil {
 		return
@@ -322,6 +346,7 @@ func (p *govorilkaPeer) handleUtterance(pcm []int16) {
 	// speed (20ms per frame) so the browser jitter buffer is not flooded.
 	ssrc := uint32(4242)
 	frameDur := 20 * time.Millisecond
+	log.Printf("govorilka: send start seq=%d ts=%d frames=%d", seq, ts, len(frames))
 	p.mu.Lock()
 	p.replying = true
 	p.mu.Unlock()
@@ -331,6 +356,7 @@ func (p *govorilkaPeer) handleUtterance(pcm []int16) {
 	// reply duration plus a small margin, and abort if the client is not
 	// keeping up.
 	playbackDeadline := time.Now().Add(time.Duration(len(frames)) * frameDur).Add(10 * time.Second)
+	first := true
 	for _, f := range frames {
 		pkt := &rtp.Packet{
 			Header: rtp.Header{
@@ -339,9 +365,15 @@ func (p *govorilkaPeer) handleUtterance(pcm []int16) {
 				SequenceNumber: seq,
 				Timestamp:      ts,
 				SSRC:           ssrc,
+				// Marker bit on the first packet: "start of talkspurt"
+				// (RFC 3550). After an interrupt + pause the client jitter
+				// buffer has moved ahead of our ts, so without this it
+				// drops the beginning of the reply as late packets.
+				Marker: first,
 			},
 			Payload: f,
 		}
+		first = false
 		// Barge-in: "стоп"/"молчи" while replying stops playback at once.
 		p.mu.Lock()
 		interrupted := p.interrupt
@@ -373,7 +405,8 @@ func (p *govorilkaPeer) handleUtterance(pcm []int16) {
 
 // speakReply synthesizes a short phrase (command confirmation) and sends it
 // to the browser. Unlike handleUtterance, it does not run the STT/brain
-// pipeline — it speaks the given text directly.
+// pipeline — it speaks the given text directly. It checks p.interrupt in
+// the send loop so a "хватит" breaks a repeating long reply too.
 func (p *govorilkaPeer) speakReply(text string) {
 	frames, err := voicekit.TTSYandex(text)
 	if err != nil {
@@ -383,16 +416,25 @@ func (p *govorilkaPeer) speakReply(text string) {
 	log.Printf("govorilka: reply-voice: %q (%d frames)", text, len(frames))
 
 	p.mu.Lock()
-	p.interrupt = false
 	out := p.outTrack
 	seq := p.seq
-	ts := p.ts
+	ts := p.syncTs(p.ts)
 	p.mu.Unlock()
 	if out == nil {
 		return
 	}
 	ssrc := uint32(4242)
+	log.Printf("govorilka: speakReply start seq=%d ts=%d frames=%d", seq, ts, len(frames))
+	first := true
 	for _, f := range frames {
+		// Barge-in: "стоп"/"молчи" while replying stops playback at once.
+		p.mu.Lock()
+		interrupted := p.interrupt
+		p.mu.Unlock()
+		if interrupted {
+			log.Printf("govorilka: interrupted, stopping playback")
+			break
+		}
 		pkt := &rtp.Packet{
 			Header: rtp.Header{
 				Version:        2,
@@ -400,9 +442,14 @@ func (p *govorilkaPeer) speakReply(text string) {
 				SequenceNumber: seq,
 				Timestamp:      ts,
 				SSRC:           ssrc,
+				// Marker bit on the first packet (start of talkspurt) so
+				// the client resets its jitter buffer and plays the
+				// repeat from the beginning after an interrupt.
+				Marker: first,
 			},
 			Payload: f,
 		}
+		first = false
 		if err := out.WriteRTP(pkt); err != nil {
 			return
 		}
@@ -413,13 +460,29 @@ func (p *govorilkaPeer) speakReply(text string) {
 	p.mu.Lock()
 	p.seq = seq
 	p.ts = ts
+	p.interrupt = false
 	p.mu.Unlock()
 }
 
 // playClick sends a short feedback tone ("tack") to the browser so the user
 // knows what is happening: low (1200Hz) = phrase accepted, high (1800Hz) =
 // reply ready. Uses the same outTrack and RTP wrapping as replies.
+//
+// It serializes with reply playback via sendMu: a tone must never interleave
+// with the RTP frames of a reply, otherwise the two writers race on p.seq/p.ts
+// (a beep that read the counters before the reply loop saved them rolls them
+// BACK, so the next reply starts with stale sequence numbers that the client
+// drops as duplicates — the "answer starts mid-way" symptom).
 func (p *govorilkaPeer) playClick(freq, amp float64) {
+	p.sendMu.Lock()
+	defer p.sendMu.Unlock()
+	p.playClickLocked(freq, amp)
+}
+
+// playClickLocked sends the tone; caller must hold sendMu. Used inside
+// handleUtterance where sendMu is already taken (ПИК-1/ПИК-2) to avoid a
+// self-deadlock.
+func (p *govorilkaPeer) playClickLocked(freq, amp float64) {
 	p.mu.Lock()
 	out := p.outTrack
 	p.mu.Unlock()
@@ -459,9 +522,10 @@ func (p *govorilkaPeer) playClick(freq, amp float64) {
 
 	p.mu.Lock()
 	seq := p.seq
-	ts := p.ts
+	ts := p.syncTs(p.ts)
 	p.mu.Unlock()
 	ssrc := uint32(4242)
+	first := true
 	for _, f := range frames {
 		pkt := &rtp.Packet{
 			Header: rtp.Header{
@@ -470,9 +534,14 @@ func (p *govorilkaPeer) playClick(freq, amp float64) {
 				SequenceNumber: seq,
 				Timestamp:      ts,
 				SSRC:           ssrc,
+				// Marker bit on the first packet: a tone is its own
+				// talkspurt, so the client plays it immediately instead
+				// of treating it as a late continuation.
+				Marker: first,
 			},
 			Payload: f,
 		}
+		first = false
 		if err := out.WriteRTP(pkt); err != nil {
 			return
 		}
@@ -579,7 +648,7 @@ func govorilkaSignal(w http.ResponseWriter, r *http.Request) {
 	// closing pc here would kill the media. pc is closed when the mic track
 	// ends (client leaves) — see OnTrack EOF.
 
-	peer := &govorilkaPeer{pc: pc}
+	peer := &govorilkaPeer{pc: pc, sessionStart: time.Now()}
 
 	// Wake-word detector: the peer starts asleep and waits for "Барон",
 	// recognized by the local Vosk speech recognizer (real STT, no false
