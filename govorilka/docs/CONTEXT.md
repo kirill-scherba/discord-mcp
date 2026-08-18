@@ -72,6 +72,9 @@ ssh root@194.58.95.91 'mv /opt/govorilka.new /opt/govorilka && chmod +x /opt/gov
   микрофон-детектор звука в говорилке" (sleep mic on low power).
 - Android app is a separate build (WebView removed, native VoiceService);
   server-side changes do not require app updates.
-- Uncommitted in working copy (pending final confirmation): playClick
-  sendMu fix + speakReply barge-in + marker bit. Commit `40da04f`
-  (timestamp) is local, not pushed.
+- Known open issue (deferred): short reply after an interrupt (pause 4-9s)
+  is not heard by the native Android client; pause >15s or <3s plays fine.
+  Deferred — needs a client-side test (logcat / test client).
+- RULE from Kirill: the server must NEVER send extra traffic — no silence
+  filler / comfort noise, ever.
+- Committed: 40da04f (timestamp), 01539c5 (interrupt fixes). Not pushed.
