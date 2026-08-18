@@ -10,6 +10,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"math"
 	"net/http"
@@ -265,6 +266,13 @@ func (p *govorilkaPeer) handleUtterance(pcm []int16) {
 			text = "Да?" // just the name was spoken
 		}
 	}
+
+	// Prepend a technical timestamp so Baron knows the current date/time
+	// and how much time has passed between messages. Marked as technical
+	// info so he doesn't mistake it for user speech (same format as the
+	// Discord voice chat in voice.go).
+	text = fmt.Sprintf("[ТЕХНИЧЕСКАЯ ИНФОРМАЦИЯ: %s UTC] %s",
+		time.Now().UTC().Format("2006-01-02 15:04"), text)
 
 	reply, err := voicekit.BrainAsk(text)
 	if err != nil {
