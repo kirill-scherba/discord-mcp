@@ -29,6 +29,13 @@ import (
 // govorilkaAddr is where the prototype page + signaling listen.
 const govorilkaAddr = ":7790"
 
+// debugLog reports whether per-packet debug logging is enabled
+// (GOV_DEBUG=1). It must stay OFF in production: at 50 packets per second
+// it floods the journal and hides every useful line.
+func debugLog() bool {
+	return os.Getenv("GOV_DEBUG") == "1"
+}
+
 // NoiseSleepAfter is how long continuous non-speech noise (STT empty) must
 // last before the peer goes back to sleep. The timer starts at the FIRST
 // noise utterance and resets on real speech.
@@ -303,7 +310,16 @@ func (p *govorilkaPeer) handleUtterance(pcm []int16) {
 		log.Printf("govorilka: brain: %v", err)
 		return
 	}
-	reply = voicekit.TrimWhitespace(reply)
+	reply, clean := voicekit.SanitizeReply(reply)
+	if !clean {
+		// The model answered with the conversation transcript instead of an
+		// answer — a symptom of an over-grown session. Retire the session and
+		// say something short rather than reading a wall of text aloud.
+		log.Printf("govorilka: brain reply is a transcript echo -> rotating session")
+		voicekit.RotateSession("transcript echo in reply")
+		reply = "Секунду, Ваше Величество, я сбился. Повторите, пожалуйста."
+	}
+	reply = voicekit.TruncateForSpeech(reply, voicekit.ReplyMaxChars())
 	if reply == "" {
 		return
 	}
@@ -408,6 +424,10 @@ func (p *govorilkaPeer) handleUtterance(pcm []int16) {
 // pipeline — it speaks the given text directly. It checks p.interrupt in
 // the send loop so a "хватит" breaks a repeating long reply too.
 func (p *govorilkaPeer) speakReply(text string) {
+	text = voicekit.TruncateForSpeech(voicekit.TrimWhitespace(text), voicekit.ReplyMaxChars())
+	if text == "" {
+		return
+	}
 	frames, err := voicekit.TTSYandex(text)
 	if err != nil {
 		log.Printf("govorilka: reply TTS: %v", err)
@@ -648,7 +668,27 @@ func govorilkaSignal(w http.ResponseWriter, r *http.Request) {
 	// closing pc here would kill the media. pc is closed when the mic track
 	// ends (client leaves) — see OnTrack EOF.
 
-	peer := &govorilkaPeer{pc: pc, sessionStart: time.Now()}
+	// lastActive MUST be initialized to now: the sleep watchdog compares
+	// time.Since(lastActive) against the wake timeout, and a zero time.Time
+	// makes the very first 5-second tick look like 55 years of inactivity,
+	// so the peer fell asleep ~5s after every connection (bug found
+	// 2026-10-24: the user was talking into a deaf server, waiting for the
+	// phone-side Vosk to send "wake").
+	peer := &govorilkaPeer{
+		pc:           pc,
+		sessionStart: time.Now(),
+		lastActive:   time.Now(),
+	}
+
+	// Connection observability: without these lines a broken call looks the
+	// same as a working one in the journal — the 2026-10-24 diagnosis had to
+	// be reconstructed from nginx logs and packet counts.
+	pc.OnICEConnectionStateChange(func(s webrtc.ICEConnectionState) {
+		log.Printf("govorilka: ice state: %s", s)
+	})
+	pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
+		log.Printf("govorilka: pc state: %s", s)
+	})
 
 	// Wake-word detector: the peer starts asleep and waits for "Барон",
 	// recognized by the local Vosk speech recognizer (real STT, no false
@@ -852,7 +892,7 @@ func govorilkaSignal(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			pktCount++
-			if pktCount <= 3 {
+			if debugLog() && pktCount <= 3 {
 				pl := rtpPacket.Payload
 				if len(pl) > 5 {
 					log.Printf("govorilka: pkt%d payload6=%02x %02x %02x %02x %02x %02x payloadLen=%d",
@@ -868,7 +908,11 @@ func govorilkaSignal(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			rms := voicekit.RMSInt16(pcmBuf[:decoded])
-			if pktCount%50 == 1 || rms < 5000 {
+			// Per-packet logging is DEBUG only: the old condition
+			// (rms < 5000) matched every silent packet, i.e. 50 lines per
+			// second, which produced a 942 MB journal on the RU VPS and
+			// buried every useful line. Enable with GOV_DEBUG=1.
+			if debugLog() && pktCount%50 == 1 {
 				log.Printf("govorilka: pkt decoded=%d rms=%.0f active=%v", decoded, rms, active)
 			}
 			// While asleep, feed every decoded frame to the Vosk wake-word
