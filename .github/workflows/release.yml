@@ -20,12 +20,13 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - name: libopus
-        run: sudo apt-get update && sudo apt-get install -y libopus-dev
-      - name: Build
+      # Text only: the voice build links libdave, which has to be compiled from source with its own
+      # archive list (CGO_LDFLAGS). The bot lives on our server, where that build exists; the catalog
+      # ships the part that works anywhere.
+      - name: Build (text only)
         env:
-          CGO_ENABLED: "1"
-        run: go build -trimpath -ldflags "-s -w" -o discord-mcp .
+          CGO_ENABLED: "0"
+        run: go build -tags novoice -trimpath -ldflags "-s -w" -o discord-mcp .
       - name: Pack
         run: |
           set -euo pipefail
