@@ -8,9 +8,10 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 )
 
-// tools returns all MCP tools exposed by discord-mcp.
+// tools returns all MCP tools exposed by discord-mcp: the text ones always, the voice ones when the
+// build carries the voice stack (they are meaningless in a build that cannot speak).
 func tools() []server.ServerTool {
-	return []server.ServerTool{
+	return append([]server.ServerTool{
 		{Tool: mcp.NewTool("discord_send",
 			mcp.WithDescription("Send a simple text message to Discord via webhook. IMPORTANT: always pass agentname — your OWN agent name, which you can find in your system prompt (your identity, who you are). So Kirill sees who sent the message."),
 			mcp.WithString("message", mcp.Description("Message text to send"), mcp.Required()),
@@ -31,19 +32,12 @@ func tools() []server.ServerTool {
 		{Tool: mcp.NewTool("discord_bot_status",
 			mcp.WithDescription("Return the voice bot status: connected guilds, voice channel, listening state."),
 		), Handler: handlerDiscordBotStatus},
-		{Tool: mcp.NewTool("discord_voice_join",
-			mcp.WithDescription("Join a Discord voice channel. If channel is empty, uses DISCORD_VOICE_CHANNEL env var."),
-			mcp.WithString("channel", mcp.Description("Voice channel name or ID (optional, defaults to env)")),
-		), Handler: handlerDiscordVoiceJoin},
-		{Tool: mcp.NewTool("discord_voice_leave",
-			mcp.WithDescription("Leave the current Discord voice channel."),
-		), Handler: handlerDiscordVoiceLeave},
 		{Tool: mcp.NewTool("discord_read",
 			mcp.WithDescription("Read recent messages from a Discord channel (by name or ID). Uses the bot token. Returns newest messages with author and time."),
 			mcp.WithString("channel", mcp.Description("Channel name (e.g. 'mail butler') or ID"), mcp.Required()),
 			mcp.WithNumber("limit", mcp.Description("Max messages (default 10, max 100)")),
 		), Handler: handlerDiscordRead},
-	}
+	}, voiceTools()...)
 }
 
 // ctx is not used by the handlers yet; kept for signature compatibility.

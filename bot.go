@@ -416,3 +416,16 @@ func handlerDiscordBotStatus(ctx context.Context, req mcp.CallToolRequest) (*mcp
 	res, _ := json.Marshal(status)
 	return mcp.NewToolResultText(string(res)), nil
 }
+
+// voiceTools returns the tools that only exist when the voice stack is linked in.
+func voiceTools() []server.ServerTool {
+	return []server.ServerTool{
+		{Tool: mcp.NewTool("discord_voice_join",
+			mcp.WithDescription("Join a Discord voice channel. If channel is empty, uses DISCORD_VOICE_CHANNEL env var."),
+			mcp.WithString("channel", mcp.Description("Voice channel name or ID (optional, defaults to env)")),
+		), Handler: handlerDiscordVoiceJoin},
+		{Tool: mcp.NewTool("discord_voice_leave",
+			mcp.WithDescription("Leave the current Discord voice channel."),
+		), Handler: handlerDiscordVoiceLeave},
+	}
+}

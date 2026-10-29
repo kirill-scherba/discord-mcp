@@ -16,6 +16,7 @@ import (
 	"context"
 
 	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/mark3labs/mcp-go/server"
 )
 
 // voiceBot is the do-nothing stand-in for the real bot: it has no connection to close.
@@ -39,3 +40,6 @@ func handlerDiscordVoiceLeave(ctx context.Context, req mcp.CallToolRequest) (*mc
 func handlerDiscordBotStatus(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	return mcp.NewToolResultText("voice bot is not part of this build (Windows text-only)."), nil
 }
+
+// voiceTools returns nothing: this build has no voice, so it does not advertise voice tools.
+func voiceTools() []server.ServerTool { return nil }
