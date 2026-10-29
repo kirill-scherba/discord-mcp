@@ -39,7 +39,9 @@ jobs:
         env:
           CGO_ENABLED: "1"
           CGO_CFLAGS: "-I${{ github.workspace }}/third_party/libdave/include"
-          CGO_LDFLAGS: "-L${{ github.workspace }}/third_party/libdave/lib -ldave -Wl,-rpath,$ORIGIN"
+          # The $ORIGIN is a linker token, not a shell variable: escape it, or bash expands it to nothing
+          # and the binary loses its rpath (29.10.2026).
+          CGO_LDFLAGS: "-L${{ github.workspace }}/third_party/libdave/lib -ldave -Wl,-rpath,\$ORIGIN"
         run: go build -trimpath -ldflags "-s -w" -o discord-mcp .
 
       - name: Pack
