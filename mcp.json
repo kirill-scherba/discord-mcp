@@ -1,0 +1,35 @@
+{
+  "name": "discord-mcp",
+  "title": {
+    "ru": "Discord",
+    "en": "Discord"
+  },
+  "description": {
+    "ru": "Отправка сообщений и embed'ов, чтение каналов, вебхук. На Linux — с голосовым ботом, на Windows — только текст.",
+    "en": "Send messages and embeds, read channels, webhook info. Voice bot on Linux; text tools on Windows."
+  },
+  "category": "messaging",
+  "install": "binary",
+  "command": [
+    "discord-mcp"
+  ],
+  "entries": {
+    "linux-amd64": "discord-mcp",
+    "windows-amd64": "discord-mcp.exe"
+  },
+  "settings": [
+    {
+      "key": "DISCORD_WEBHOOK_URL",
+      "label": "вебхук канала",
+      "hint": "Discord → Канал → Интеграции → Вебхуки",
+      "secret": true
+    },
+    {
+      "key": "DISCORD_BOT_TOKEN",
+      "label": "токен бота (для чтения каналов)",
+      "hint": "Discord Developer Portal → Bot",
+      "secret": true
+    }
+  ],
+  "docs": "https://github.com/kirill-scherba/discord-mcp#readme"
+}
