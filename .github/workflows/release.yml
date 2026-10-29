@@ -1,8 +1,8 @@
-# Release: Linux with voice, Windows without.
+# Release: Linux with voice, Windows as text tools.
 #
-# Voice needs libopus and DAVE (both C); that is fine on the Linux server where the bot lives and not
-# something to carry into a single Windows binary. The Windows build has the build tag "novoice": all the
-# text tools work, the voice tools answer that voice is not part of this build.
+# Voice needs libopus and libdave. libdave used to look like an unbuildable C++ dependency; Discord
+# publishes prebuilt archives (MIT) for Linux and Windows, so the build is reproducible: download the
+# archive, point CGO at it, and ship libdave.so next to the binary with an $ORIGIN rpath.
 name: release
 
 on:
@@ -15,26 +15,43 @@ permissions:
 jobs:
   linux:
     runs-on: ubuntu-latest
+    env:
+      DAVE_VERSION: v1.2.2
+      DAVE_URL: https://github.com/discord/libdave/releases/download/v1.2.2%2Fcpp/libdave-Linux-X64-boringssl.zip
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      # Text only: the voice build links libdave, which has to be compiled from source with its own
-      # archive list (CGO_LDFLAGS). The bot lives on our server, where that build exists; the catalog
-      # ships the part that works anywhere.
-      - name: Build (text only)
+
+      - name: libopus
+        run: sudo apt-get update && sudo apt-get install -y libopus-dev
+
+      - name: libdave
+        run: |
+          set -euo pipefail
+          curl -sSL -o /tmp/libdave.zip "$DAVE_URL"
+          mkdir -p third_party/libdave
+          unzip -q -o /tmp/libdave.zip -d third_party/libdave
+          ls third_party/libdave/lib
+
+      - name: Build with voice
         env:
-          CGO_ENABLED: "0"
-        run: go build -tags novoice -trimpath -ldflags "-s -w" -o discord-mcp .
+          CGO_ENABLED: "1"
+          CGO_CFLAGS: "-I${{ github.workspace }}/third_party/libdave/include"
+          CGO_LDFLAGS: "-L${{ github.workspace }}/third_party/libdave/lib -ldave -Wl,-rpath,$ORIGIN"
+        run: go build -trimpath -ldflags "-s -w" -o discord-mcp .
+
       - name: Pack
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME#v}"
           zip="discord-mcp_${tag}_linux-amd64.zip"
-          zip -q "$zip" discord-mcp
+          cp third_party/libdave/lib/libdave.so .
+          zip -q "$zip" discord-mcp libdave.so
           sha256sum "$zip" > "$zip.sha256"
           cat "$zip.sha256"
+
       - uses: softprops/action-gh-release@v2
         with:
           files: |
@@ -48,6 +65,8 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      # Text only for now: the voice build on Windows needs MinGW plus opus and libdave DLLs; the
+      # text tools are what a person on a desktop uses.
       - name: Build (text only)
         shell: bash
         env:
@@ -63,7 +82,6 @@ jobs:
           zip="discord-mcp_${tag}_windows-amd64.zip"
           powershell -NoProfile -Command "Compress-Archive -Path discord-mcp.exe -DestinationPath '$zip' -Force"
           sha256sum "$zip" > "$zip.sha256"
-          cat "$zip.sha256"
       - uses: softprops/action-gh-release@v2
         with:
           files: |

@@ -21,6 +21,7 @@ import (
 	"github.com/kirill-scherba/discordgo"
 	"github.com/kirill-scherba/discordgo/dave"
 	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/mark3labs/mcp-go/server"
 )
 
 // redirectLibdaveLogs installs a global log sink for libdave. Without it,
