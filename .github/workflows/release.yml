@@ -25,7 +25,7 @@ jobs:
           go-version-file: go.mod
 
       - name: libopus
-        run: sudo apt-get update && sudo apt-get install -y libopus-dev
+        run: sudo apt-get update && sudo apt-get install -y libopus-dev libopusfile-dev
 
       - name: libdave
         run: |
