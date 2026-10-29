@@ -20,6 +20,8 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var loginInput: EditText
     private lateinit var passInput: EditText
+    private var connectBtn: android.widget.Button? = null
+    private var stopBtn: android.widget.Button? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -135,13 +137,16 @@ class MainActivity : AppCompatActivity() {
         connectBtn.text = "Подключиться"
         connectBtn.setOnClickListener { saveAndConnect() }
         column.addView(connectBtn)
+        this.connectBtn = connectBtn
 
         val stopBtn = android.widget.Button(this)
         stopBtn.text = "Стоп"
         stopBtn.setOnClickListener { stopEverything() }
         column.addView(stopBtn)
+        this.stopBtn = stopBtn
 
         setContentView(root)
+        updateButtons()
 
         // Микрофон нужен для нативного WebRTC (VoiceService).
         // FOREGROUND_SERVICE_MICROPHONE — normal-разрешение (в манифесте),
@@ -152,13 +157,9 @@ class MainActivity : AppCompatActivity() {
             != PackageManager.PERMISSION_GRANTED
         ) {
             ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.RECORD_AUDIO), 1)
-        } else {
-            // If credentials are already saved, start immediately (pocket
-            // mode). Otherwise the user enters them first.
-            if (savedLogin().isNotEmpty() && savedPass().isNotEmpty()) {
-                startVoiceService()
-            }
         }
+        // No auto-start: the service runs only after the user presses
+        // "Подключиться" and stops with "Стоп" or the sleep timeout.
     }
 
     // Save credentials and start the service (pocket mode).
@@ -199,6 +200,7 @@ class MainActivity : AppCompatActivity() {
         // Without the reset, the next launch would skip startVoiceService()
         // and the app would do nothing.
         serviceStarted = false
+        updateButtons()
         finishAndRemoveTask()
     }
 
@@ -207,9 +209,7 @@ class MainActivity : AppCompatActivity() {
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-            if (savedLogin().isNotEmpty() && savedPass().isNotEmpty()) {
-                startVoiceService()
-            }
+            Log.d("Govorilka", "permission granted")
         }
     }
 
@@ -231,6 +231,9 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         Log.d("Govorilka", "onResume: приложение снова активно")
+        // Reflect the current service state on the buttons (it may have
+        // stopped via the sleep timeout while the app was in the background).
+        updateButtons()
     }
 
     override fun onDestroy() {
@@ -249,6 +252,20 @@ class MainActivity : AppCompatActivity() {
         } else {
             startService(intent)
         }
+        // Let the service onCreate run, then reflect its state on the buttons.
+        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+            updateButtons()
+        }, 500)
+    }
+
+    // The buttons reflect the service state: "Стоп" is enabled while the
+    // service runs (listening or asleep), "Подключиться" is enabled when
+    // the service is off.
+    private fun updateButtons() {
+        val running = VoiceService.isRunning()
+        connectBtn?.isEnabled = !running
+        stopBtn?.isEnabled = running
+        Log.d("Govorilka", "buttons updated: running=$running")
     }
 
     companion object {

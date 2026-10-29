@@ -4,6 +4,8 @@
 // the Gateway API (not webhooks), listens for the !voice command, joins the
 // configured voice channel, records speech, transcribes it, asks Baron
 // (opencode-serve) for a reply, and speaks the reply back via TTS.
+//go:build !novoice
+
 package main
 
 import (

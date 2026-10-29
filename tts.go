@@ -1,4 +1,6 @@
 // tts.go — text-to-speech. Thin wrapper over voicekit (shared pipeline).
+//go:build !novoice
+
 package main
 
 import (

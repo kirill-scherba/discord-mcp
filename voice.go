@@ -1,4 +1,6 @@
 // voice.go — recording loop: Opus -> PCM -> VAD -> WAV -> STT -> brain -> TTS.
+//go:build !novoice
+
 package main
 
 import (

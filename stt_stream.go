@@ -7,6 +7,8 @@
 //
 // Enabled with STT_PROVIDER=yandex-stream. The synchronous path (whisper,
 // yandex) is kept intact.
+//go:build !novoice
+
 package main
 
 import (

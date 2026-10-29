@@ -1,4 +1,6 @@
 // stt.go — speech-to-text. Thin wrapper over voicekit (shared pipeline).
+//go:build !novoice
+
 package main
 
 import (

@@ -1,0 +1,70 @@
+# Release: Linux with voice, Windows without.
+#
+# Voice needs libopus and DAVE (both C); that is fine on the Linux server where the bot lives and not
+# something to carry into a single Windows binary. The Windows build has the build tag "novoice": all the
+# text tools work, the voice tools answer that voice is not part of this build.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: libopus
+        run: sudo apt-get update && sudo apt-get install -y libopus-dev
+      - name: Build
+        env:
+          CGO_ENABLED: "1"
+        run: go build -trimpath -ldflags "-s -w" -o discord-mcp .
+      - name: Pack
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          zip="discord-mcp_${tag}_linux-amd64.zip"
+          zip -q "$zip" discord-mcp
+          sha256sum "$zip" > "$zip.sha256"
+          cat "$zip.sha256"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            discord-mcp_*_linux-amd64.zip
+            discord-mcp_*_linux-amd64.zip.sha256
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build (text only)
+        shell: bash
+        env:
+          CGO_ENABLED: "0"
+          GOOS: windows
+          GOARCH: amd64
+        run: go build -tags novoice -trimpath -ldflags "-s -w" -o discord-mcp.exe .
+      - name: Pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          zip="discord-mcp_${tag}_windows-amd64.zip"
+          powershell -NoProfile -Command "Compress-Archive -Path discord-mcp.exe -DestinationPath '$zip' -Force"
+          sha256sum "$zip" > "$zip.sha256"
+          cat "$zip.sha256"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            discord-mcp_*_windows-amd64.zip
+            discord-mcp_*_windows-amd64.zip.sha256

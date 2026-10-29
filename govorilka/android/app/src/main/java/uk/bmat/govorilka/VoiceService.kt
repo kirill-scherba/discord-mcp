@@ -64,6 +64,18 @@ class VoiceService : Service() {
     private var serverDc: org.webrtc.DataChannel? = null
     private var micSender: RtpSender? = null
 
+    // --- Battery saver ---
+    // If the server stays asleep (waiting for "Барон") longer than
+    // sleepTimeoutMs, the service stops completely — mic, WebRTC, wake word.
+    // The user starts it again with the "Подключиться" button.
+    // warnBeforeMs before the stop a warning tone plays so the user can still
+    // say "Барон" and keep the session alive.
+    private val sleepTimeoutMs = 2 * 60_000L
+    private val warnBeforeMs = 30_000L
+    private var sleepTimeoutRunnable: Runnable? = null
+    private var sleepWarnRunnable: Runnable? = null
+    @Volatile private var shuttingDown = false
+
     // Native playback of the server's reply is handled by WebRTC itself
     // (WebRtcAudioTrack -> Java AudioTrack), which works in the background
     // thanks to the foreground service. No custom AudioTrack sink needed.
@@ -140,6 +152,8 @@ class VoiceService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         Log.d("Govorilka", "VoiceService onStartCommand")
+        // If we shut down for battery, do not let the system resurrect us.
+        if (shuttingDown) return START_NOT_STICKY
         startForegroundCompat()
         connect()
         startWatchdog()
@@ -436,11 +450,15 @@ class VoiceService : Service() {
                     handler?.post {
                         setMicMuted(true)
                         startLocalVosk()
+                        // Battery saver: stop everything if "Барон" is not
+                        // said within sleepTimeoutMs.
+                        scheduleSleepTimeout()
                     }
                 }
                 "awake" -> {
                     Log.d("Govorilka", "server awake -> unmute mic, stop local vosk")
                     handler?.post {
+                        cancelSleepTimeout()
                         setMicMuted(false)
                         stopLocalVosk()
                     }
@@ -448,6 +466,83 @@ class VoiceService : Service() {
             }
         } catch (e: Exception) {
             Log.d("Govorilka", "control msg error: ${e.message}")
+        }
+    }
+
+    // Battery saver timeout: started on {"state":"sleep"}, cancelled on
+    // {"state":"awake"}. When it fires, the service stops completely — the
+    // user starts it again with the "Подключиться" button.
+    // A warning tone plays warnBeforeMs early so the user can still say
+    // "Барон" and cancel the shutdown.
+    private fun scheduleSleepTimeout() {
+        cancelSleepTimeout()
+        val warn = Runnable {
+            Log.d("Govorilka", "sleep timeout warning: say \"Барон\" or the service stops")
+            // Noticeable ascending "динь-динь-динь" on the alarm stream.
+            playTone(android.media.ToneGenerator.TONE_DTMF_7, 200)
+            Thread.sleep(240)
+            if (!shuttingDown) {
+                playTone(android.media.ToneGenerator.TONE_DTMF_8, 200)
+                Thread.sleep(240)
+            }
+            if (!shuttingDown) {
+                playTone(android.media.ToneGenerator.TONE_DTMF_9, 200)
+            }
+        }
+        val stop = Runnable {
+            Log.d("Govorilka", "sleep timeout ${sleepTimeoutMs}ms reached -> shutdown for battery")
+            shutdownForBattery()
+        }
+        sleepWarnRunnable = warn
+        sleepTimeoutRunnable = stop
+        handler?.postDelayed(warn, sleepTimeoutMs - warnBeforeMs)
+        handler?.postDelayed(stop, sleepTimeoutMs)
+    }
+
+    private fun cancelSleepTimeout() {
+        sleepTimeoutRunnable?.let { handler?.removeCallbacks(it) }
+        sleepWarnRunnable?.let { handler?.removeCallbacks(it) }
+        sleepTimeoutRunnable = null
+        sleepWarnRunnable = null
+    }
+
+    // Full stop: kill WebRTC, wake word, notification. No reconnect — the
+    // user starts the service manually. Plays a noticeable descending
+    // "ба-дум-дум" so the user knows the service stopped.
+    private fun shutdownForBattery() {
+        if (shuttingDown) return
+        shuttingDown = true
+        cancelSleepTimeout()
+        stopLocalVosk()
+        disconnect()
+        playTone(android.media.ToneGenerator.TONE_DTMF_9, 220)
+        Thread.sleep(240)
+        if (shuttingDown) {
+            playTone(android.media.ToneGenerator.TONE_DTMF_6, 220)
+            Thread.sleep(240)
+        }
+        if (shuttingDown) {
+            playTone(android.media.ToneGenerator.TONE_DTMF_3, 220)
+            Thread.sleep(260)
+        }
+        stopForeground(true)
+        stopSelf()
+        Log.d("Govorilka", "service stopped for battery (shuttingDown=true)")
+    }
+
+    // Play a system tone on the alarm stream (loud enough to notice).
+    // Blocks the calling thread for the tone duration; only used on the
+    // service handler thread during shutdown/warning.
+    private fun playTone(tone: Int, durationMs: Int) {
+        try {
+            val tg = android.media.ToneGenerator(
+                android.media.AudioManager.STREAM_ALARM, 100
+            )
+            tg.startTone(tone, durationMs)
+            Thread.sleep((durationMs + 50).toLong())
+            tg.release()
+        } catch (e: Exception) {
+            Log.d("Govorilka", "tone error: ${e.message}")
         }
     }
 
@@ -532,6 +627,8 @@ class VoiceService : Service() {
     private var lastConnectedAt = 0L
 
     private fun scheduleReconnect(reason: String) {
+        // After a battery shutdown the service must stay dead.
+        if (shuttingDown) return
         if (reconnectScheduled) return
         reconnectScheduled = true
         reconnectAttempts++
@@ -557,6 +654,8 @@ class VoiceService : Service() {
         watchdogRunning = true
         handler?.postDelayed(object : Runnable {
             override fun run() {
+                // After a battery shutdown the service must stay dead.
+                if (shuttingDown) return
                 val state = pc?.connectionState()
                 val connected = state == PeerConnection.PeerConnectionState.CONNECTED
                 if (!connected) {
@@ -619,6 +718,10 @@ class VoiceService : Service() {
 
         @Volatile
         private var instance: VoiceService? = null
+
+        // True while the service is alive (used by MainActivity to reflect
+        // the state on the Подключиться/Стоп buttons).
+        fun isRunning(): Boolean = instance != null
 
         // Called from MainActivity when the user switches the server host:
         // reconnect to the new host (re-reads the URL from prefs in connect()).

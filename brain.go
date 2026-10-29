@@ -3,6 +3,8 @@
 // Shared pipeline (sessions, brainAsk) lives in voicekit; this file keeps the
 // contact book lookup and participant join/leave notifications used only by
 // the Discord bot.
+//go:build !novoice
+
 package main
 
 import (
